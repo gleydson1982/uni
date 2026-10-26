@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UNI - Rastreador Uniswap em Tempo Real</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:Arial,sans-serif}
+body{background:#0f0f12;color:#fff;min-height:100vh;padding:20px}
+.container{max-width:900px;margin:0 auto}
+header{text-align:center;margin:20px 0 30px}
+header h1{font-size:2.4rem}
+header p{color:#aaa;margin-top:5px}
+.card{background:#1a1a1f;border:1px solid #2a2a33;border-radius:16px;padding:20px;margin-bottom:16px}
+.main-price{text-align:center;padding:30px}
+.label{color:#888;font-size:.9rem;text-transform:uppercase}
+.price{font-size:3rem;font-weight:800;margin:10px 0}
+.change{font-weight:600;padding:6px 14px;border-radius:20px;display:inline-block}
+.change.up{background:#0f2a1a;color:#2ecc71}
+.change.down{background:#2a0f14;color:#ff5a5a}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px}
+.value{font-size:1.4rem;font-weight:700;margin-top:8px}
+footer{text-align:center;color:#666;margin-top:20px;font-size:.85rem}
+small{color:#666;display:block;margin-top:10px;text-align:center}
+</style>
+</head>
+<body>
+<div class="container">
+<header><h1>🦄 UNI Tracker</h1><p>Utilize Nosso Rastreador Uniswap (UNI) em Tempo Real</p></header>
+<div class="card main-price">
+<div class="label">Preço Atual UNI / USD</div>
+<div class="price" id="price">$ --</div>
+<div class="change" id="change">--</div>
+</div>
+<div class="grid">
+<div class="card"><div class="label">24h Alta</div><div class="value" id="high">$ --</div></div>
+<div class="card"><div class="label">24h Baixa</div><div class="value" id="low">$ --</div></div>
+<div class="card"><div class="label">Volume 24h</div><div class="value" id="volume">$ --</div></div>
+<div class="card"><div class="label">Market Cap</div><div class="value" id="marketcap">$ --</div></div>
+</div>
+<div class="card"><h3>Grafico ao Vivo</h3><canvas id="chart"></canvas><small>Atualização automática a cada 30s via CoinGecko</small></div>
+<footer>Dados: CoinGecko</footer>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+const els={price:document.getElementById('price'),change:document.getElementById('change'),high:document.getElementById('high'),low:document.getElementById('low'),volume:document.getElementById('volume'),marketcap:document.getElementById('marketcap')}
+let chart;
+async function fetchData(){
+try{
+const res=await fetch('https://api.coingecko.com/api/v3/coins/uniswap?localization=false&tickers=false&market_data=true');
+const data=await res.json();
+const m=data.market_data;
+const price=m.current_price.usd;
+const change=m.price_change_percentage_24h;
+els.price.textContent=`$ ${price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})}`;
+els.change.textContent=`${change>0?'+':''}${change.toFixed(2)}% 24h`;
+els.change.className='change '+(change>=0?'up':'down');
+els.high.textContent=`$ ${m.high_24h.usd.toLocaleString()}`;
+els.low.textContent=`$ ${m.low_24h.usd.toLocaleString()}`;
+els.volume.textContent=`$ ${(m.total_volume.usd/1e6).toFixed(1)}M`;
+els.marketcap.textContent=`$ ${(m.market_cap.usd/1e9).toFixed(2)}B`;
+const spark=m.sparkline_7d.price;
+updateChart(spark.slice(-48));
+}catch(e){console.error(e)}
+}
+function updateChart(data){
+const ctx=document.getElementById('chart').getContext('2d');
+if(chart)chart.destroy();
+chart=new Chart(ctx,{type:'line',data:{labels:data.map((_,i)=>i),datasets:[{data,borderColor:'#ff007a',backgroundColor:'rgba(255,0,122,0.1)',fill:true,tension:0.4,pointRadius:0}]},options:{plugins:{legend:{display:false}},scales:{x:{display:false},y:{display:false}}}});
+}
+fetchData();setInterval(fetchData,30000);
+</script>
+</body>
+</html>
