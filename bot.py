@@ -1,53 +1,48 @@
 from flask import Flask
 import requests, time, threading, os
-from web3 import Web3
 app = Flask(__name__)
 
-RPCS = [
-    "https://bsc-dataseed.binance.org",
-    "https://bsc-dataseed1.binance.org",
-    "https://bsc-dataseed2.binance.org",
-    "https://bsc-dataseed3.binance.org",
-    "https://bsc-dataseed4.binance.org"
-]
-
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-ACCOUNT = Web3().eth.account.from_key(PRIVATE_KEY).address if PRIVATE_KEY else "SEM CHAVE"
+RPCS = ["https://bsc-dataseed.binance.org","https://bsc-dataseed1.binance.org"]
+ACCOUNT = "0x8AEE0c5120f326C2389E3B6affa39E3BEBe82Fd3"
 ACCOUNT_LC = ACCOUNT.lower()
-UNI_BSC = "0xBf5140A22578168FD562DCcF235E5D43A02Ce9B5".lower()
+
+# 2 contratos possíveis de UNI na BSC
+UNI_TOKENS = [
+ "0xBf5140A22578168FD562DCcF235E5D43A02Ce9B5".lower(),
+ "0xfa7f8980b82d27e25093811d26411535ac6393c1".lower()
+]
 
 estado = {"preco": 7.05, "msg": "Iniciando...", "grids": []}
 for i in range(1,21):
     estado["grids"].append({"n":i,"venda":round(6.83+i*0.20,2),"status":"AGUARDANDO"})
 
-def get_bnb_balance_raw(rpc, wallet):
+def get_balances_raw(rpc, wallet):
+    # BNB
     payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[wallet,"latest"],"id":1}
-    r = requests.post(rpc, json=payload, timeout=8)
-    hex_bal = r.json()["result"]
-    return int(hex_bal,16)/1e18
-
-def get_token_balance_raw(rpc, token, wallet):
-    # balanceOf(address) -> 0x70a08231 + padded address
-    data = "0x70a08231" + wallet[2:].zfill(64)
-    payload = {"jsonrpc":"2.0","method":"eth_call","params":[{"to":token,"data":data},"latest"],"id":1}
-    r = requests.post(rpc, json=payload, timeout=8)
-    res = r.json()
-    if "result" not in res:
-        raise Exception(str(res)[:200])
-    hex_bal = res["result"]
-    if hex_bal == "0x": return 0
-    return int(hex_bal,16)/1e18
+    bnb = int(requests.post(rpc, json=payload, timeout=8).json()["result"],16)/1e18
+    # UNI - tenta todos os contratos
+    uni_total = 0
+    detalhes = ""
+    for token in UNI_TOKENS:
+        data = "0x70a08231" + wallet[2:].zfill(64)
+        payload = {"jsonrpc":"2.0","method":"eth_call","params":[{"to":token,"data":data},"latest"],"id":1}
+        r = requests.post(rpc, json=payload, timeout=8).json()
+        val = 0
+        if "result" in r and r["result"] != "0x" and r["result"] != "0x0000000000000000000000000000000000000000000000000000000000000000":
+            try: val = int(r["result"],16)/1e18
+            except: val = 0
+        uni_total += val
+        detalhes += f" {token[:6]}:{val:.4f}"
+    return bnb, uni_total, detalhes
 
 def get_saldo():
     for rpc in RPCS:
         try:
-            bnb = get_bnb_balance_raw(rpc, ACCOUNT_LC)
-            uni = get_token_balance_raw(rpc, UNI_BSC, ACCOUNT_LC)
-            return f"CONECTADO OK! | RPC: {rpc} | BNB: {bnb:.5f} | UNI: {uni:.4f} | Carteira: {ACCOUNT}"
+            bnb, uni, det = get_balances_raw(rpc, ACCOUNT_LC)
+            return f"CONECTADO OK! | RPC: {rpc} | BNB: {bnb:.5f} | UNI: {uni:.4f} | DET:{det} | Carteira: {ACCOUNT}"
         except Exception as e:
-            last = f"{rpc} -> {str(e)[:200]}"
-            continue
-    return f"ERRO EM TODOS - Ultimo: {last}"
+            last = f"{rpc} -> {str(e)[:150]}"
+    return f"ERRO - {last}"
 
 def pega_preco():
     try:
