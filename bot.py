@@ -1,48 +1,29 @@
 from flask import Flask
-import requests, time, threading, os
+import requests, time, threading
 app = Flask(__name__)
 
-RPCS = ["https://bsc-dataseed.binance.org","https://bsc-dataseed1.binance.org"]
 ACCOUNT = "0x8AEE0c5120f326C2389E3B6affa39E3BEBe82Fd3"
-ACCOUNT_LC = ACCOUNT.lower()
+UNI_CONTRACT = "0xBf5140A22578168FD562DCcF235E5D43A02Ce9B1"
 
-# 2 contratos possíveis de UNI na BSC
-UNI_TOKENS = [
- "0xBf5140A22578168FD562DCcF235E5D43A02Ce9B5".lower(),
- "0xfa7f8980b82d27e25093811d26411535ac6393c1".lower()
-]
-
-estado = {"preco": 7.05, "msg": "Iniciando...", "grids": []}
+estado = {"preco": 7.06, "msg": "Iniciando...", "grids": []}
 for i in range(1,21):
     estado["grids"].append({"n":i,"venda":round(6.83+i*0.20,2),"status":"AGUARDANDO"})
 
-def get_balances_raw(rpc, wallet):
-    # BNB
-    payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[wallet,"latest"],"id":1}
-    bnb = int(requests.post(rpc, json=payload, timeout=8).json()["result"],16)/1e18
-    # UNI - tenta todos os contratos
-    uni_total = 0
-    detalhes = ""
-    for token in UNI_TOKENS:
-        data = "0x70a08231" + wallet[2:].zfill(64)
-        payload = {"jsonrpc":"2.0","method":"eth_call","params":[{"to":token,"data":data},"latest"],"id":1}
-        r = requests.post(rpc, json=payload, timeout=8).json()
-        val = 0
-        if "result" in r and r["result"] != "0x" and r["result"] != "0x0000000000000000000000000000000000000000000000000000000000000000":
-            try: val = int(r["result"],16)/1e18
-            except: val = 0
-        uni_total += val
-        detalhes += f" {token[:6]}:{val:.4f}"
-    return bnb, uni_total, detalhes
-
-def get_saldo():
-    for rpc in RPCS:
-        try:
-            bnb, uni, det = get_balances_raw(rpc, ACCOUNT_LC)
-            return f"CONECTADO OK! | RPC: {rpc} | BNB: {bnb:.5f} | UNI: {uni:.4f} | DET:{det} | Carteira: {ACCOUNT}"
-        except Exception as e:
-            last = f"{rpc} -> {str(e)[:150]}"
-    return f"ERRO - {last}"
+def get_saldo_bscscan():
+    try:
+        # Tenta BscScan API direto
+        url = f"https://api.bscscan.com/api?module=account&action=tokenbalance&contractaddress={UNI_CONTRACT}&address={ACCOUNT}&tag=latest"
+        r = requests.get(url, timeout=10).json()
+        uni = 0
+        if r.get("status") == "1":
+            uni = int(r["result"]) / 1e18
+        # BNB
+        url2 = f"https://api.bscscan.com/api?module=account&action=balance&address={ACCOUNT}&tag=latest"
+        r2 = requests.get(url2, timeout=10).json()
+        bnb = int(r2["result"]) / 1e18 if r2.get("status")=="1" else 0
+        return f"CONECTADO BSCSCAN OK! | BNB: {bnb:.5f} | UNI: {uni:.4f} | Contrato: {UNI_CONTRACT[:10]}... | Carteira: {ACCOUNT}"
+    except Exception as e:
+        return f"ERRO BSCSCAN: {str(e)[:200]}"
 
 def pega_preco():
     try:
@@ -53,7 +34,7 @@ def pega_preco():
 def loop():
     while True:
         estado["preco"] = pega_preco()
-        estado["msg"] = get_saldo()
+        estado["msg"] = get_saldo_bscscan()
         time.sleep(10)
 
 threading.Thread(target=loop, daemon=True).start()
