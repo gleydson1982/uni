@@ -4,39 +4,50 @@ from web3 import Web3
 app = Flask(__name__)
 
 RPCS = [
-    "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93d87595a3524a732",
+    "https://bsc-dataseed.binance.org",
     "https://bsc-dataseed1.binance.org",
     "https://bsc-dataseed2.binance.org",
     "https://bsc-dataseed3.binance.org",
-    "https://1rpc.io/bnb",
-    "https://bsc.publicnode.com",
-    "https://rpc.ankr.com/bsc"
+    "https://bsc-dataseed4.binance.org"
 ]
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 ACCOUNT = Web3().eth.account.from_key(PRIVATE_KEY).address if PRIVATE_KEY else "SEM CHAVE"
-UNI_BSC = Web3.to_checksum_address("0xBf5140A22578168FD562DCcF235E5D43A02Ce9B5")
-
-ABI = '[{"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]'
+ACCOUNT_LC = ACCOUNT.lower()
+UNI_BSC = "0xBf5140A22578168FD562DCcF235E5D43A02Ce9B5".lower()
 
 estado = {"preco": 7.05, "msg": "Iniciando...", "grids": []}
 for i in range(1,21):
     estado["grids"].append({"n":i,"venda":round(6.83+i*0.20,2),"status":"AGUARDANDO"})
 
-def get_saldo_tentando_todos():
+def get_bnb_balance_raw(rpc, wallet):
+    payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[wallet,"latest"],"id":1}
+    r = requests.post(rpc, json=payload, timeout=8)
+    hex_bal = r.json()["result"]
+    return int(hex_bal,16)/1e18
+
+def get_token_balance_raw(rpc, token, wallet):
+    # balanceOf(address) -> 0x70a08231 + padded address
+    data = "0x70a08231" + wallet[2:].zfill(64)
+    payload = {"jsonrpc":"2.0","method":"eth_call","params":[{"to":token,"data":data},"latest"],"id":1}
+    r = requests.post(rpc, json=payload, timeout=8)
+    res = r.json()
+    if "result" not in res:
+        raise Exception(str(res)[:200])
+    hex_bal = res["result"]
+    if hex_bal == "0x": return 0
+    return int(hex_bal,16)/1e18
+
+def get_saldo():
     for rpc in RPCS:
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout':8}))
-            if not w3.is_connected(): continue
-            bnb = float(w3.from_wei(w3.eth.get_balance(Web3.to_checksum_address(ACCOUNT)),'ether'))
-            c = w3.eth.contract(address=UNI_BSC, abi=ABI)
-            bal = c.functions.balanceOf(Web3.to_checksum_address(ACCOUNT)).call()
-            uni = float(w3.from_wei(bal,'ether'))
-            return f"CONECTADO OK | RPC: {rpc} | BNB: {bnb:.5f} | UNI: {uni:.4f} | Conta: {ACCOUNT}"
+            bnb = get_bnb_balance_raw(rpc, ACCOUNT_LC)
+            uni = get_token_balance_raw(rpc, UNI_BSC, ACCOUNT_LC)
+            return f"CONECTADO OK! | RPC: {rpc} | BNB: {bnb:.5f} | UNI: {uni:.4f} | Carteira: {ACCOUNT}"
         except Exception as e:
-            last = f"RPC {rpc} falhou: {str(e)[:150]}"
+            last = f"{rpc} -> {str(e)[:200]}"
             continue
-    return f"ERRO EM TODOS RPCs - Ultimo: {last}"
+    return f"ERRO EM TODOS - Ultimo: {last}"
 
 def pega_preco():
     try:
@@ -47,15 +58,15 @@ def pega_preco():
 def loop():
     while True:
         estado["preco"] = pega_preco()
-        estado["msg"] = get_saldo_tentando_todos()
-        time.sleep(15)
+        estado["msg"] = get_saldo()
+        time.sleep(10)
 
 threading.Thread(target=loop, daemon=True).start()
 
 @app.route("/dashboard")
 def dash():
-    h=f"<html><head><meta http-equiv='refresh' content='5'></head><body style='background:#111;color:#fff;font-family:Arial;padding:10px;word-break:break-all'>"
-    h+=f"<h2>VENDA REAL - {ACCOUNT}</h2><div style='background:#222;padding:12px;border-left:4px solid #0f0'>Preco: ${estado['preco']:.4f}<br>{estado['msg']}</div><br>"
+    h=f"<html><head><meta http-equiv='refresh' content='5'></head><body style='background:#111;color:#0f0;font-family:monospace;padding:10px;word-break:break-all'>"
+    h+=f"<h2 style='color:#fff'>VENDA REAL - {ACCOUNT}</h2><div style='background:#222;padding:12px;border-left:4px solid #0f0'>Preco UNI: ${estado['preco']:.4f}<br>{estado['msg']}</div><br>"
     for g in estado["grids"]:
         h+=f"<div>Grid {g['n']}: ${g['venda']} -> {g['status']}</div>"
     h+="</body></html>"
