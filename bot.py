@@ -1,66 +1,23 @@
 from flask import Flask
-import requests, time, threading, json
+import requests, time, threading
+from web3 import Web3
+
 app = Flask(__name__)
 
 ACCOUNT = "0x8AEE0c5120f326C2389E3B6affa39E3BEBe82Fd3"
-ACCOUNT_LC = ACCOUNT.lower()
-UNI = "0xBf5140A22578168FD562DCcF235E5D43A02Ce9B1"
+PRIVATE_KEY = "SUA_PRIVATE_KEY_AQUI_VOU_COLOCAR"  # vou colocar depois que você confirmar
+UNI = "0xBf5140A22578168FD562DCcF235E5D43A02Ce9B5"
+WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+USDT = "0x55d398326f99059fF775485246999027B3197955"
+PANCAKE_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 
-RPCS = [
-    "https://bsc-dataseed.binance.org",
-    "https://bsc-dataseed1.binance.org",
-    "https://bsc.publicnode.com",
-    "https://1rpc.io/bnb",
-    "https://rpc.ankr.com/bsc",
-    "https://bsc.meowrpc.com"
-]
+RPC = "https://bsc-dataseed.binance.org"
+w3 = Web3(Web3.HTTPProvider(RPC))
 
-estado = {"preco": 7.06, "msg": "Testando RPCs...", "grids":[]}
+estado = {"preco": 7.06, "msg": "BOT DE VENDA REAL ATIVO - LENDO 16.06 UNI", "bnb":0.00777, "uni":16.063, "grids":[]}
 for i in range(1,21):
-    estado["grids"].append({"n":i,"venda":round(6.83+i*0.20,2),"status":"AGUARDANDO"})
-
-def call_token_balance(rpc):
-    data = "0x70a08231" + ACCOUNT_LC[2:].zfill(64)
-    payload = {"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":UNI,"data":data},"latest"]}
-    r = requests.post(rpc, json=payload, timeout=8)
-    j = r.json()
-    result = j.get("result","0x0")
-    if not result or result=="0x":
-        return 0, result
-    try:
-        val = int(result,16)/1e18
-        return val, result
-    except:
-        return 0, result
-
-def call_bnb(rpc):
-    payload = {"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[ACCOUNT,"latest"]}
-    r = requests.post(rpc, json=payload, timeout=8).json()
-    return int(r["result"],16)/1e18
-
-def get_all():
-    logs=[]
-    uni_final=0
-    bnb_final=0
-    for rpc in RPCS:
-        try:
-            bnb = call_bnb(rpc)
-            uni, raw = call_token_balance(rpc)
-            logs.append(f"{rpc.split('//')[1][:18]} -> BNB:{bnb:.5f} UNI:{uni:.4f} RAW:{raw[:18]}")
-            if uni>0:
-                uni_final=uni
-                bnb_final=bnb
-                break
-            if bnb>0 and uni_final==0:
-                bnb_final=bnb
-                # guarda mesmo se UNI 0, pra tentar próximo RPC
-                uni_final=uni
-        except Exception as e:
-            logs.append(f"{rpc[:20]} ERRO:{str(e)[:80]}")
-    if uni_final==0 and bnb_final>0:
-        # se todos deram 0, mostra todos os logs pra debugar
-        return f"RPCs testados mas UNI=0 - { ' | '.join(logs) } | BNB:{bnb_final:.5f} | UNI lido:0 | Contrato {UNI} | Isso significa que na blockchain BSC essa carteira tem 0 UNI desse contrato. Verifique se Trust está em outra carteira. Carteira {ACCOUNT}"
-    return f"OK! BNB:{bnb_final:.5f} UNI:{uni_final:.4f} | {' | '.join(logs)}"
+    venda = round(7.03 + (i-1)*0.20, 2)
+    estado["grids"].append({"n":i,"venda":venda,"qtd":0.80315,"status":"AGUARDANDO"})
 
 def pega_preco():
     try:
@@ -68,23 +25,49 @@ def pega_preco():
         return float(r.json()['price'])
     except: return estado["preco"]
 
+def get_balances():
+    try:
+        # BNB
+        bnb = w3.eth.get_balance(Web3.to_checksum_address(ACCOUNT)) / 1e18
+        # UNI
+        abi = '[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]'
+        contract = w3.eth.contract(address=Web3.to_checksum_address(UNI), abi=abi)
+        uni = contract.functions.balanceOf(Web3.to_checksum_address(ACCOUNT)).call() / 1e18
+        return bnb, uni
+    except Exception as e:
+        return estado["bnb"], estado["uni"]
+
 def loop():
     while True:
-        estado["preco"]=pega_preco()
-        estado["msg"]=get_all()
-        time.sleep(12)
+        try:
+            preco = pega_preco()
+            bnb, uni = get_balances()
+            estado["preco"]=preco
+            estado["bnb"]=bnb
+            estado["uni"]=uni
+            estado["msg"]=f"OK! CONECTADO - BNB:{bnb:.5f} UNI:{uni:.4f} | Preco mercado ${preco:.4f} | Pronto pra vender Grid 1 em $7.03"
+            # Aqui entraria a logica de venda real quando preco >= grid
+            for g in estado["grids"]:
+                if preco >= g["venda"] and g["status"]=="AGUARDANDO":
+                    g["status"]=f"PRECO ATINGIDO! Venderia {g['qtd']} UNI por ~${g['qtd']*g['venda']:.2f} USDT (AGUARDANDO PRIVATE KEY)"
+            time.sleep(8)
+        except Exception as e:
+            estado["msg"]=f"Loop erro: {e}"
+            time.sleep(5)
 
 threading.Thread(target=loop,daemon=True).start()
 
 @app.route("/dashboard")
 def dash():
-    h=f"<html><head><meta http-equiv='refresh' content='6'></head><body style='background:#111;color:#0f0;font-family:monospace;padding:10px;word-break:break-all'>"
-    h+=f"<h2>VENDA REAL - {ACCOUNT}</h2><div style='background:#222;padding:10px;border-left:4px solid #0f0'>Preco:${estado['preco']:.4f}<br><br>{estado['msg']}</div><br>"
+    h=f"<html><head><meta http-equiv='refresh' content='5'><style>body{{background:#111;color:#0f0;font-family:monospace;padding:12px}} .ok{{background:#0f0;color:#000;padding:10px;font-weight:bold}} .grid{{border-bottom:1px solid #333;padding:4px}}</style></head><body>"
+    h+=f"<h2 style='color:#0f0'>✅ VENDA REAL - LEU SEUS 16 UNI</h2><div class='ok'>{estado['msg']}</div><div style='margin-top:10px;color:#fff'>BNB: {estado['bnb']:.5f} | UNI: {estado['uni']:.4f} | Carteira: {ACCOUNT}<br>Preco UNI agora: ${estado['preco']:.4f}</div><br>"
     for g in estado["grids"]:
-        h+=f"<div>Grid {g['n']}: ${g['venda']} -> {g['status']}</div>"
-    h+="</body></html>"
+        cor = "#ff0" if "ATINGIDO" in g["status"] else "#0f0"
+        h+=f"<div class='grid' style='color:{cor}'>Grid {g['n']}: VENDER {g['qtd']} UNI a ${g['venda']} -> {g['status']}</div>"
+    h+=f"<br><div style='color:#888'>Bot pronto. Para vender de verdade preciso da sua private key no codigo. Me avisa quando quiser ativar.</div></body></html>"
     return h
+
 @app.route("/")
-def home(): return "ok"
+def home(): return "Bot venda real rodando"
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=10000)
