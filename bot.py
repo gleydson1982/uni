@@ -4,6 +4,35 @@ from web3 import Web3
 from datetime import datetime
 
 app = Flask(__name__)
+
+# ===== CONFIG PLANILHA - NOVO =====
+GOOGLE_SHEET_URL = os.environ.get("GOOGLE_SHEET_URL", "").strip() or os.environ.get("GOOGLE_SHEETS_URL", "").strip()
+
+def salva_na_planilha(tipo, preco, qtd, lucro_trade, hash_tx, usdt_atual, uni_atual):
+    try:
+        if not GOOGLE_SHEET_URL:
+            print("SEM GOOGLE_SHEET_URL")
+            return
+        agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        total = round(preco * qtd, 2)
+        payload = {
+            "data": agora,
+            "tipo": tipo,
+            "preco": preco,
+            "qtd": qtd,
+            "total": total,
+            "lucro_trade": lucro_trade,
+            "lucro_total": round(estado.get("lucro_total", 0), 2),
+            "hash": str(hash_tx)[:66],
+            "saldo_usdt": round(usdt_atual, 2),
+            "saldo_uni": round(uni_atual, 4)
+        }
+        requests.post(GOOGLE_SHEET_URL, json=payload, timeout=8)
+        print(f"Salvo na planilha: {tipo} {qtd} @ {preco}")
+    except Exception as e:
+        print(f"Erro planilha: {e}")
+# ===== FIM CONFIG PLANILHA =====
+
 ACCOUNT = Web3.to_checksum_address("0x8AEE0c5120f326C2389E3B6affa39E3BEBe82Fd3")
 UNI = Web3.to_checksum_address("0xBf5140A22578168FD562DCcF235E5D43A02Ce9B1")
 USDT = Web3.to_checksum_address("0x55d398326f99059fF775485246999027B3197955")
@@ -111,7 +140,7 @@ def swap_real(token_in,token_out,qtd):
                 if receipt.status==1:
                     return True,h_sw.hex()
                 else:
-                    last_err=f"tx reverted status 0 - {h_sw.hex()} - gas {gas_gwei} gwei - prox degrau"
+                    last_err=f"tx reverted status 0 - {h_sw.hex()} - gas {gas_gwei} gwei"
                     time.sleep(1)
                     continue
             except Exception as e:
@@ -139,9 +168,11 @@ def loop():
                             lucro=(g["venda"] - g["ultima_compra"])*g["qtd"]
                             g["lucro"]+=lucro; g["tipo"]="VENDIDO"; g["status"]=f"VENDIDO +${lucro:.2f} - Pronto p/ compra"; g["vezes"]+=1; g["ultimo_tempo"]=agora
                             estado["trades"].insert(0,{"data":datetime.now().strftime("%d/%m %H:%M"),"tipo":"VENDA","preco":g["venda"],"qtd":g["qtd"],"lucro":lucro})
-                            estado["lucro_total"]+=lucro; salvar()
+                            estado["lucro_total"]+=lucro
+                            salva_na_planilha("VENDA", g["venda"], g["qtd"], lucro, res, usdt, uni)
+                            salvar()
                         else:
-                            estado["msg"]=f"VENDA G{g['n']} FALHOU - {res} - tenta prox ciclo"
+                            estado["msg"]=f"VENDA G{g['n']} FALHOU - {res}"
                 if preco <= g["preco"] and g["tipo"]=="VENDIDO":
                     need = g["usdt"]
                     if usdt >= need*0.9 and need <= 10.5:
@@ -149,9 +180,10 @@ def loop():
                         if ok:
                             g["ultima_compra"]=preco; g["tipo"]="COMPRADO"; g["status"]=f"COMPRADO ${preco} - Pronto p/ venda"; g["ultimo_tempo"]=agora
                             estado["trades"].insert(0,{"data":datetime.now().strftime("%d/%m %H:%M"),"tipo":"COMPRA","preco":preco,"qtd":g["qtd"],"lucro":0})
+                            salva_na_planilha("COMPRA", preco, g["qtd"], 0, res, usdt, uni)
                             salvar()
                         else:
-                            estado["msg"]=f"COMPRA G{g['n']} FALHOU - {res} - tenta prox ciclo"
+                            estado["msg"]=f"COMPRA G{g['n']} FALHOU - {res}"
             estado["msg"]=f"PRECO REAL ${preco:.4f} ({fonte}) | BNB:{bnb:.4f} UNI:{uni:.2f} USDT:{usdt:.2f} | Lucro ${estado['lucro_total']:.2f}"
             salvar(); time.sleep(12)
         except Exception as e:
@@ -164,10 +196,10 @@ def dash():
     cor_status = "#22c55e" if estado.get("preco_status")=="OK" else "#ef4444"
     fonte = estado.get("preco_fonte","-"); update = estado.get("preco_update","-"); status = estado.get("preco_status","-"); preco_real = estado.get("preco_real", estado.get("preco",0))
     html=f"<html><head><meta http-equiv='refresh' content='5'><meta name='viewport' content='width=device-width'><style>body{{background:#0d0d0f;color:#fff;font-family:Arial;padding:12px}} .card{{background:#1a1a1e;border-radius:12px;padding:14px;margin:10px 0}} .row{{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #222;font-size:13px}} .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} @media(max-width:700px){{.grid2{{grid-template-columns:1fr}}}}</style></head><body>"
-    html+=f"<div class='card' style='display:flex;justify-content:space-between'><div><b>🤖 UNI GRID - AUTO STATUS PELO PRECO REAL</b><br><span style='font-size:12px;background:#0f2a1a;color:#22c55e;padding:4px 8px;border-radius:20px'>● COMPRA E VENDE SOZINHO + STATUS AUTO + ESCADA GAS</span></div><div style='text-align:right'>BNB {estado['bnb']:.4f}<br>UNI {estado['uni']:.2f}<br>USDT {estado['usdt']:.2f}</div></div>"
-    html+=f"<div class='card' style='border:2px solid {cor_status}'><b>PREÇO REAL UNI - STATUS AUTO</b><div style='display:flex;justify-content:space-between;margin-top:10px'><div><div style='font-size:36px;font-weight:bold;color:{cor_status}'>${preco_real:.4f}</div><div style='font-size:12px;color:#8b949e'>Fonte: {fonte} | Update: {update}</div></div><div style='text-align:right'><div style='font-size:12px;padding:6px 10px;border-radius:8px;background:#222;color:{cor_status}'><b>Status: {status}</b></div></div></div></div>"
-    html+=f"<div class='grid2'><div class='card'><b>CARTEIRA $270.93</b><div class='row'><span>UNI</span><span>{estado['uni']:.4f} = ${estado['uni']*estado['preco']:.2f}</span></div><div class='row'><span>USDT</span><span>{estado['usdt']:.4f}</span></div><div style='background:#0f1e3a;border-radius:10px;padding:12px;margin-top:10px'><div style='color:#60a5fa;font-weight:bold'>SALDO USDT</div><div style='font-size:32px;color:#3b82f6;font-weight:bold'>${estado['usdt']:.2f}</div><div style='color:#8b949e;font-size:12px'>{estado['msg']}</div></div></div>"
-    html+=f"<div class='card'><b>Lucro</b><div style='font-size:36px;color:#22c55e'>+${estado['lucro_total']:.2f}</div><div style='color:#8b949e'>Escada gas $0.01 ate $0.03</div></div></div>"
+    html+=f"<div class='card' style='display:flex;justify-content:space-between'><div><b>🤖 UNI GRID - PLANILHA AUTO</b><br><span style='font-size:12px;background:#0f2a1a;color:#22c55e;padding:4px 8px;border-radius:20px'>● COMPRA E VENDE SOZINHO + PLANILHA AUTO</span></div><div style='text-align:right'>BNB {estado['bnb']:.4f}<br>UNI {estado['uni']:.2f}<br>USDT {estado['usdt']:.2f}</div></div>"
+    html+=f"<div class='card' style='border:2px solid {cor_status}'><b>PREÇO REAL UNI</b><div style='display:flex;justify-content:space-between;margin-top:10px'><div><div style='font-size:36px;font-weight:bold;color:{cor_status}'>${preco_real:.4f}</div><div style='font-size:12px;color:#8b949e'>Fonte: {fonte} | Update: {update}</div></div><div style='text-align:right'><div style='font-size:12px;padding:6px 10px;border-radius:8px;background:#222;color:{cor_status}'><b>Status: {status}</b></div></div></div></div>"
+    html+=f"<div class='grid2'><div class='card'><b>CARTEIRA</b><div class='row'><span>UNI</span><span>{estado['uni']:.4f} = ${estado['uni']*estado['preco']:.2f}</span></div><div class='row'><span>USDT</span><span>{estado['usdt']:.4f}</span></div><div style='background:#0f1e3a;border-radius:10px;padding:12px;margin-top:10px'><div style='color:#60a5fa;font-weight:bold'>SALDO USDT</div><div style='font-size:32px;color:#3b82f6;font-weight:bold'>${estado['usdt']:.2f}</div><div style='color:#8b949e;font-size:12px'>{estado['msg']}</div></div></div>"
+    html+=f"<div class='card'><b>Lucro</b><div style='font-size:36px;color:#22c55e'>+${estado['lucro_total']:.2f}</div><div style='color:#8b949e'>Planilha: {'OK' if GOOGLE_SHEET_URL else 'SEM URL'}</div></div></div>"
     html+=f"<div class='grid2'><div class='card'><b>GRID 20 NIVEIS</b>"
     for g in estado["grids"]:
         cor="#22c55e" if g["tipo"]=="COMPRADO" else "#ef4444"
@@ -181,5 +213,5 @@ def dash():
     return html
 
 @app.route("/")
-def home(): return "Bot auto status pelo preco real - /dashboard"
+def home(): return "Bot com planilha - /dashboard"
 if __name__=="__main__": app.run(host="0.0.0.0",port=10000)
