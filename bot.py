@@ -8,8 +8,9 @@ from web3 import Web3
 
 app = Flask(__name__)
 
-ROUTER_ADDRESS = Web3.to_checksum_address(
-    "0x10ED43C718714eB63B5aA57B78B54704E256024E"
+# PancakeSwap V2 e tokens na BNB Smart Chain.
+FACTORY_ADDRESS = Web3.to_checksum_address(
+    "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 )
 UNI_ADDRESS = Web3.to_checksum_address(
     "0xBf5140A22578168FD562DCcF235E5D43A02ce9B1"
@@ -21,8 +22,8 @@ WBNB_ADDRESS = Web3.to_checksum_address(
     "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 )
 
-# O Render pode receber um RPC próprio pela variável BSC_RPC_URL.
-# Se ele falhar, o bot tenta os endereços públicos abaixo.
+# Pode receber um RPC próprio em BSC_RPC_URL.
+# Se não for definido ou falhar, o bot tenta os RPCs públicos.
 RPC_URLS = [
     os.getenv("BSC_RPC_URL", "").strip(),
     "https://bsc-dataseed.binance.org/",
@@ -31,6 +32,7 @@ RPC_URLS = [
     "https://bsc-dataseed3.binance.org/",
     "https://bsc-dataseed4.binance.org/",
     "https://bsc-rpc.publicnode.com",
+    "https://1rpc.io/bnb",
 ]
 RPC_URLS = list(dict.fromkeys(url for url in RPC_URLS if url))
 
@@ -44,26 +46,45 @@ PERDA_MAXIMA_USDT = 0.10
 INTERVALO_SEGUNDOS = 30
 TEMPO_LIMITE_RPC = 12
 
-ERC20_ABI = [
+FACTORY_ABI = [
     {
-        "inputs": [],
-        "name": "decimals",
-        "outputs": [{"type": "uint8", "name": ""}],
+        "inputs": [
+            {"internalType": "address", "name": "tokenA", "type": "address"},
+            {"internalType": "address", "name": "tokenB", "type": "address"},
+        ],
+        "name": "getPair",
+        "outputs": [{"internalType": "address", "name": "pair", "type": "address"}],
         "stateMutability": "view",
         "type": "function",
     }
 ]
 
-ROUTER_ABI = [
+PAIR_ABI = [
     {
-        "inputs": [
-            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
-            {"internalType": "address[]", "name": "path", "type": "address[]"},
-        ],
-        "name": "getAmountsOut",
+        "inputs": [],
+        "name": "token0",
+        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "getReserves",
         "outputs": [
-            {"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}
+            {"internalType": "uint112", "name": "reserve0", "type": "uint112"},
+            {"internalType": "uint112", "name": "reserve1", "type": "uint112"},
+            {"internalType": "uint32", "name": "blockTimestampLast", "type": "uint32"},
         ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+ERC20_ABI = [
+    {
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
         "stateMutability": "view",
         "type": "function",
     }
@@ -85,6 +106,7 @@ STATE = {
     "ultima_atualizacao": None,
     "last_error": "",
     "rpc_usado": "",
+    "rota_usada": "",
     "grids": [],
     "logs": [],
     "historico": [],
@@ -98,10 +120,46 @@ def log(mensagem):
     print(registro, flush=True)
 
 def nome_rpc(url):
-    try:
-        return url.split("://", 1)[-1].split("/", 1)[0]
-    except Exception:
-        return "RPC"
+    return url.split("://", 1)[-1].split("/", 1)[0]
+
+def verificar_endereco(cliente, nome, endereco):
+    codigo = cliente.eth.get_code(endereco)
+    if len(bytes(codigo)) == 0:
+        raise ValueError(
+            f"Não foi encontrado código de contrato para {nome} na BNB Chain."
+        )
+
+def obter_decimais(cliente, endereco):
+    contrato = cliente.eth.contract(address=endereco, abi=ERC20_ABI)
+    return int(contrato.functions.decimals().call())
+
+def preco_no_par(cliente, factory, token_a, token_b, decimais_a, decimais_b):
+    endereco_par = factory.functions.getPair(token_a, token_b).call()
+
+    if endereco_par.lower() == "0x0000000000000000000000000000000000000000":
+        raise ValueError("Não existe pool V2 para esse par.")
+
+    endereco_par = Web3.to_checksum_address(endereco_par)
+    contrato_par = cliente.eth.contract(address=endereco_par, abi=PAIR_ABI)
+    endereco_token0 = contrato_par.functions.token0().call()
+    reserva0, reserva1, _ = contrato_par.functions.getReserves().call()
+
+    if reserva0 <= 0 or reserva1 <= 0:
+        raise ValueError("O pool existe, mas não tem reservas disponíveis.")
+
+    token0_e_a = endereco_token0.lower() == token_a.lower()
+
+    if token0_e_a:
+        reserva_a = reserva0 / (10 ** decimais_a)
+        reserva_b = reserva1 / (10 ** decimais_b)
+    else:
+        reserva_a = reserva1 / (10 ** decimais_a)
+        reserva_b = reserva0 / (10 ** decimais_b)
+
+    if reserva_a <= 0 or reserva_b <= 0:
+        raise ValueError("As reservas do pool retornaram um valor inválido.")
+
+    return reserva_b / reserva_a
 
 def obter_preco_em_rpc(url):
     cliente = Web3(
@@ -120,75 +178,71 @@ def obter_preco_em_rpc(url):
             f"O RPC respondeu pela rede {chain_id}, não pela BNB Smart Chain."
         )
 
-    contratos = {
-        "roteador PancakeSwap": ROUTER_ADDRESS,
-        "UNI": UNI_ADDRESS,
-        "USDT": USDT_ADDRESS,
-        "WBNB": WBNB_ADDRESS,
-    }
+    verificar_endereco(cliente, "Factory PancakeSwap V2", FACTORY_ADDRESS)
+    verificar_endereco(cliente, "UNI", UNI_ADDRESS)
+    verificar_endereco(cliente, "USDT", USDT_ADDRESS)
+    verificar_endereco(cliente, "WBNB", WBNB_ADDRESS)
 
-    for nome, endereco in contratos.items():
-        codigo = cliente.eth.get_code(endereco)
-        if not codigo:
-            raise ValueError(
-                f"Não foi encontrado código de contrato para {nome} "
-                "na BNB Smart Chain."
-            )
+    factory = cliente.eth.contract(address=FACTORY_ADDRESS, abi=FACTORY_ABI)
 
-    router = cliente.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
-    uni = cliente.eth.contract(address=UNI_ADDRESS, abi=ERC20_ABI)
-    usdt = cliente.eth.contract(address=USDT_ADDRESS, abi=ERC20_ABI)
+    decimais_uni = obter_decimais(cliente, UNI_ADDRESS)
+    decimais_usdt = obter_decimais(cliente, USDT_ADDRESS)
+    decimais_wbnb = obter_decimais(cliente, WBNB_ADDRESS)
 
-    uni_decimals = int(uni.functions.decimals().call())
-    usdt_decimals = int(usdt.functions.decimals().call())
-    amount_uni = 10 ** uni_decimals
+    try:
+        preco = preco_no_par(
+            cliente,
+            factory,
+            UNI_ADDRESS,
+            USDT_ADDRESS,
+            decimais_uni,
+            decimais_usdt,
+        )
+        return preco, "UNI/USDT direto"
+    except Exception as erro_direto:
+        erro_direto = str(erro_direto)
 
-    rotas = [
-        ("UNI → USDT", [UNI_ADDRESS, USDT_ADDRESS]),
-        ("UNI → WBNB → USDT", [UNI_ADDRESS, WBNB_ADDRESS, USDT_ADDRESS]),
-    ]
-    erros_rota = []
-
-    for nome_rota, caminho in rotas:
-        try:
-            amounts = router.functions.getAmountsOut(
-                amount_uni,
-                caminho,
-            ).call()
-
-            if len(amounts) < 2:
-                raise ValueError("A rota não retornou valores suficientes.")
-
-            preco = amounts[-1] / (10 ** usdt_decimals)
-            if preco <= 0:
-                raise ValueError("A rota retornou uma cotação igual a zero.")
-
-            return preco
-
-        except Exception as erro:
-            erros_rota.append(f"{nome_rota}: {str(erro)[:180]}")
-
-    raise RuntimeError(
-        "Nenhuma rota retornou cotação. "
-        + " | ".join(erros_rota)
-    )
+    try:
+        preco_uni_wbnb = preco_no_par(
+            cliente,
+            factory,
+            UNI_ADDRESS,
+            WBNB_ADDRESS,
+            decimais_uni,
+            decimais_wbnb,
+        )
+        preco_wbnb_usdt = preco_no_par(
+            cliente,
+            factory,
+            WBNB_ADDRESS,
+            USDT_ADDRESS,
+            decimais_wbnb,
+            decimais_usdt,
+        )
+        return preco_uni_wbnb * preco_wbnb_usdt, "UNI/WBNB → WBNB/USDT"
+    except Exception as erro_rota:
+        raise RuntimeError(
+            "Não foi possível obter cotação nem pelo pool direto UNI/USDT "
+            "nem pela rota via WBNB. "
+            f"Direto: {erro_direto[:180]} | Via WBNB: {str(erro_rota)[:180]}"
+        )
 
 def obter_preco_uni_usdt():
-    erros_rpc = []
+    erros = []
 
     for url in RPC_URLS:
         servidor = nome_rpc(url)
         try:
-            preco = obter_preco_em_rpc(url)
+            preco, rota = obter_preco_em_rpc(url)
             with lock:
                 STATE["rpc_usado"] = servidor
+                STATE["rota_usada"] = rota
             return preco
         except Exception as erro:
-            erros_rpc.append(f"{servidor}: {str(erro)[:220]}")
+            erros.append(f"{servidor}: {str(erro)[:250]}")
 
-    detalhes = " || ".join(erros_rpc)
     raise ConnectionError(
-        "Falha em todos os RPCs configurados. " + detalhes
+        "Todos os RPCs falharam. " + " || ".join(erros)
     )
 
 def calcular_resultado():
@@ -220,12 +274,12 @@ def iniciar_carteira_virtual(preco):
 
     STATE["grids"] = [
         {
-            "id": i + 1,
-            "preco": minimo + i * passo,
+            "id": indice + 1,
+            "preco": minimo + indice * passo,
             "operacoes": 0,
             "ultima_operacao": "Aguardando cruzamento",
         }
-        for i in range(NIVEIS)
+        for indice in range(NIVEIS)
     ]
 
     calcular_resultado()
@@ -240,24 +294,21 @@ def registrar_operacao(tipo, nivel, preco):
         if valor <= 0:
             return
 
-        preco_execucao_estimado = preco * (1 + slippage)
-        quantidade = (valor * (1 - custo)) / preco_execucao_estimado
+        preco_execucao = preco * (1 + slippage)
+        quantidade = (valor * (1 - custo)) / preco_execucao
 
         STATE["saldo_usdt_virtual"] -= valor
         STATE["saldo_uni_virtual"] += quantidade
         descricao = f"Compra simulada de {quantidade:.8f} UNI"
-
     else:
-        preco_execucao_estimado = preco * (1 - slippage)
-        quantidade_desejada = ORDEM_USDT / preco_execucao_estimado
+        preco_execucao = preco * (1 - slippage)
+        quantidade_desejada = ORDEM_USDT / preco_execucao
         quantidade = min(quantidade_desejada, STATE["saldo_uni_virtual"])
 
         if quantidade <= 0:
             return
 
-        valor_bruto = quantidade * preco_execucao_estimado
-        valor_liquido = valor_bruto * (1 - custo)
-
+        valor_liquido = quantidade * preco_execucao * (1 - custo)
         STATE["saldo_uni_virtual"] -= quantidade
         STATE["saldo_usdt_virtual"] += valor_liquido
         descricao = f"Venda simulada de {quantidade:.8f} UNI"
@@ -267,15 +318,17 @@ def registrar_operacao(tipo, nivel, preco):
     grid["operacoes"] += 1
     grid["ultima_operacao"] = tipo
 
-    registro = {
-        "hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "tipo": tipo,
-        "nivel": nivel + 1,
-        "preco": preco,
-        "descricao": descricao,
-        "observacao": "Simulação; nenhuma transação real foi enviada.",
-    }
-    STATE["historico"].insert(0, registro)
+    STATE["historico"].insert(
+        0,
+        {
+            "hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            "tipo": tipo,
+            "nivel": nivel + 1,
+            "preco": preco,
+            "descricao": descricao,
+            "observacao": "Simulação; nenhuma transação real foi enviada.",
+        },
+    )
     STATE["historico"] = STATE["historico"][:50]
 
     log(
@@ -332,7 +385,7 @@ def loop_bot():
             preco = atualizar_cotacao()
             log(f"Preço consultado: ${preco:.6f} USDT por UNI.")
         except Exception as erro:
-            mensagem = str(erro)[:900]
+            mensagem = str(erro)[:1200]
             with lock:
                 STATE["last_error"] = mensagem
                 if not STATE["parado_por_limite"]:
@@ -364,17 +417,17 @@ p{color:#aebbd0;overflow-wrap:anywhere}
 .item{padding:9px 0;border-bottom:1px solid #26374e;font-size:12px;overflow-wrap:anywhere}
 .item:last-child{border-bottom:0}
 .error{color:#ff8b96;white-space:pre-wrap}
-.muted{color:#9eafc7;font-size:12px}
+.muted{color:#9eafc7;font-size:12px;overflow-wrap:anywhere}
 @media(max-width:700px){body{padding:12px}.columns{grid-template-columns:1fr}.value{font-size:18px}}
 </style>
 </head>
 <body>
 <main>
   <h1>UNI/USDT · Grid em simulação</h1>
-  <p>BNB Smart Chain · PancakeSwap · Painel somente para leitura</p>
+  <p>BNB Smart Chain · PancakeSwap V2 · Painel somente para leitura</p>
   <div class="notice">
-    Este bot não compra nem vende tokens reais. Ele simula as operações e não usa
-    chave privada. O preço pode variar e a simulação não garante lucro.
+    Este bot não compra nem vende tokens reais. Ele consulta as reservas dos pools
+    e simula operações. Não usa chave privada e não garante lucro.
   </div>
 
   <section class="cards">
@@ -385,7 +438,7 @@ p{color:#aebbd0;overflow-wrap:anywhere}
   </section>
 
   <p id="status">Conectando...</p>
-  <p class="muted" id="rpc"></p>
+  <p class="muted" id="route"></p>
   <p class="muted" id="updated"></p>
   <p class="error" id="error"></p>
 
@@ -431,8 +484,10 @@ async function load(){
     document.getElementById("pnl").textContent=
       (s.resultado_usdt>=0?"+":"")+"$"+fmt(s.resultado_usdt,4);
     document.getElementById("status").textContent="Status: "+s.status;
-    document.getElementById("rpc").textContent=
-      s.rpc_usado?"RPC consultado: "+s.rpc_usado:"";
+    document.getElementById("route").textContent=
+      s.rpc_usado
+        ? "RPC: "+s.rpc_usado+" · Rota: "+(s.rota_usada||"aguardando")
+        : "";
     document.getElementById("updated").textContent=
       s.ultima_atualizacao?"Última atualização: "+s.ultima_atualizacao:"";
     document.getElementById("error").textContent=s.last_error||"";
