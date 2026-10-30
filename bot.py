@@ -2,13 +2,12 @@ import os
 import time
 import threading
 from datetime import datetime
+
 from flask import Flask, jsonify, render_template_string
 from web3 import Web3
 
 app = Flask(__name__)
 
-# UNI e USDT na BNB Smart Chain. O contrato UNI é o endereço informado pelo usuário.
-RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed.binance.org/")
 ROUTER_ADDRESS = Web3.to_checksum_address(
     "0x10ED43C718714eB63B5aA57B78B54704E256024E"
 )
@@ -22,7 +21,19 @@ WBNB_ADDRESS = Web3.to_checksum_address(
     "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 )
 
-# Parâmetros da simulação
+# O Render pode receber um RPC próprio pela variável BSC_RPC_URL.
+# Se ele falhar, o bot tenta os endereços públicos abaixo.
+RPC_URLS = [
+    os.getenv("BSC_RPC_URL", "").strip(),
+    "https://bsc-dataseed.binance.org/",
+    "https://bsc-dataseed1.binance.org/",
+    "https://bsc-dataseed2.binance.org/",
+    "https://bsc-dataseed3.binance.org/",
+    "https://bsc-dataseed4.binance.org/",
+    "https://bsc-rpc.publicnode.com",
+]
+RPC_URLS = list(dict.fromkeys(url for url in RPC_URLS if url))
+
 CAPITAL_USDT = 1.00
 NIVEIS = 5
 FAIXA_PERCENTUAL = 0.05
@@ -31,8 +42,7 @@ SLIPPAGE_PERCENTUAL = 0.01
 CUSTO_ESTIMADO_PERCENTUAL = 0.003
 PERDA_MAXIMA_USDT = 0.10
 INTERVALO_SEGUNDOS = 30
-
-w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 12}))
+TEMPO_LIMITE_RPC = 12
 
 ERC20_ABI = [
     {
@@ -59,10 +69,6 @@ ROUTER_ABI = [
     }
 ]
 
-router = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
-uni_contract = w3.eth.contract(address=UNI_ADDRESS, abi=ERC20_ABI)
-usdt_contract = w3.eth.contract(address=USDT_ADDRESS, abi=ERC20_ABI)
-
 lock = threading.RLock()
 
 STATE = {
@@ -78,6 +84,7 @@ STATE = {
     "parado_por_limite": False,
     "ultima_atualizacao": None,
     "last_error": "",
+    "rpc_usado": "",
     "grids": [],
     "logs": [],
     "historico": [],
@@ -90,37 +97,99 @@ def log(mensagem):
         STATE["logs"] = STATE["logs"][:30]
     print(registro, flush=True)
 
-def obter_decimais(token):
-    return int(token.functions.decimals().call())
+def nome_rpc(url):
+    try:
+        return url.split("://", 1)[-1].split("/", 1)[0]
+    except Exception:
+        return "RPC"
 
-def cotacao_por_rota(amount_in, path, decimals_saida):
-    amounts = router.functions.getAmountsOut(amount_in, path).call()
-    if len(amounts) < 2:
-        raise ValueError("A PancakeSwap não retornou uma cotação válida.")
-    return amounts[-1] / (10 ** decimals_saida)
+def obter_preco_em_rpc(url):
+    cliente = Web3(
+        Web3.HTTPProvider(
+            url,
+            request_kwargs={"timeout": TEMPO_LIMITE_RPC},
+        )
+    )
 
-def obter_preco_uni_usdt():
-    if not w3.is_connected():
-        raise ConnectionError("Não foi possível conectar à BNB Smart Chain.")
+    if not cliente.is_connected():
+        raise ConnectionError("Não foi possível conectar a este RPC.")
 
-    uni_decimals = obter_decimais(uni_contract)
-    usdt_decimals = obter_decimais(usdt_contract)
+    chain_id = cliente.eth.chain_id
+    if chain_id != 56:
+        raise ConnectionError(
+            f"O RPC respondeu pela rede {chain_id}, não pela BNB Smart Chain."
+        )
+
+    contratos = {
+        "roteador PancakeSwap": ROUTER_ADDRESS,
+        "UNI": UNI_ADDRESS,
+        "USDT": USDT_ADDRESS,
+        "WBNB": WBNB_ADDRESS,
+    }
+
+    for nome, endereco in contratos.items():
+        codigo = cliente.eth.get_code(endereco)
+        if not codigo:
+            raise ValueError(
+                f"Não foi encontrado código de contrato para {nome} "
+                "na BNB Smart Chain."
+            )
+
+    router = cliente.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
+    uni = cliente.eth.contract(address=UNI_ADDRESS, abi=ERC20_ABI)
+    usdt = cliente.eth.contract(address=USDT_ADDRESS, abi=ERC20_ABI)
+
+    uni_decimals = int(uni.functions.decimals().call())
+    usdt_decimals = int(usdt.functions.decimals().call())
     amount_uni = 10 ** uni_decimals
 
-    try:
-        # Primeiro tenta a rota direta UNI → USDT.
-        return cotacao_por_rota(
-            amount_uni,
-            [UNI_ADDRESS, USDT_ADDRESS],
-            usdt_decimals,
-        )
-    except Exception:
-        # Se não houver rota direta, tenta UNI → WBNB → USDT.
-        return cotacao_por_rota(
-            amount_uni,
-            [UNI_ADDRESS, WBNB_ADDRESS, USDT_ADDRESS],
-            usdt_decimals,
-        )
+    rotas = [
+        ("UNI → USDT", [UNI_ADDRESS, USDT_ADDRESS]),
+        ("UNI → WBNB → USDT", [UNI_ADDRESS, WBNB_ADDRESS, USDT_ADDRESS]),
+    ]
+    erros_rota = []
+
+    for nome_rota, caminho in rotas:
+        try:
+            amounts = router.functions.getAmountsOut(
+                amount_uni,
+                caminho,
+            ).call()
+
+            if len(amounts) < 2:
+                raise ValueError("A rota não retornou valores suficientes.")
+
+            preco = amounts[-1] / (10 ** usdt_decimals)
+            if preco <= 0:
+                raise ValueError("A rota retornou uma cotação igual a zero.")
+
+            return preco
+
+        except Exception as erro:
+            erros_rota.append(f"{nome_rota}: {str(erro)[:180]}")
+
+    raise RuntimeError(
+        "Nenhuma rota retornou cotação. "
+        + " | ".join(erros_rota)
+    )
+
+def obter_preco_uni_usdt():
+    erros_rpc = []
+
+    for url in RPC_URLS:
+        servidor = nome_rpc(url)
+        try:
+            preco = obter_preco_em_rpc(url)
+            with lock:
+                STATE["rpc_usado"] = servidor
+            return preco
+        except Exception as erro:
+            erros_rpc.append(f"{servidor}: {str(erro)[:220]}")
+
+    detalhes = " || ".join(erros_rpc)
+    raise ConnectionError(
+        "Falha em todos os RPCs configurados. " + detalhes
+    )
 
 def calcular_resultado():
     preco = STATE["preco"]
@@ -223,7 +292,6 @@ def processar_movimento(preco_anterior, preco_atual):
 
         if preco_anterior > nivel and preco_atual <= nivel:
             registrar_operacao("COMPRA", indice, preco_atual)
-
         elif preco_anterior < nivel and preco_atual >= nivel:
             registrar_operacao("VENDA", indice, preco_atual)
 
@@ -264,11 +332,12 @@ def loop_bot():
             preco = atualizar_cotacao()
             log(f"Preço consultado: ${preco:.6f} USDT por UNI.")
         except Exception as erro:
+            mensagem = str(erro)[:900]
             with lock:
-                STATE["last_error"] = str(erro)[:250]
+                STATE["last_error"] = mensagem
                 if not STATE["parado_por_limite"]:
                     STATE["status"] = "Erro ao consultar preço"
-            log(f"Falha na consulta de preço: {erro}")
+            log(f"Falha na consulta de preço: {mensagem}")
 
         time.sleep(INTERVALO_SEGUNDOS)
 
@@ -284,20 +353,19 @@ HTML = """
 body{margin:0;padding:20px;background:#0b1220;color:#e8eef8;font:14px Arial,sans-serif}
 main{max-width:1100px;margin:auto}
 h1{margin:0 0 5px;font-size:23px}
-p{color:#aebbd0}
+h2{font-size:17px;margin:0 0 10px}
+p{color:#aebbd0;overflow-wrap:anywhere}
 .notice{padding:12px;border:1px solid #76602d;background:#211d12;border-radius:9px;color:#f3dda1;margin:16px 0}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
-.card{background:#121e30;border:1px solid #283a54;border-radius:10px;padding:14px}
+.card,.box{background:#121e30;border:1px solid #283a54;border-radius:10px;padding:14px;min-width:0}
 .label{color:#9eafc7;font-size:12px}
 .value{display:block;font-size:20px;font-weight:bold;margin-top:7px;overflow-wrap:anywhere}
 .columns{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
-.box{background:#121e30;border:1px solid #283a54;border-radius:10px;padding:14px}
-.item{padding:9px 0;border-bottom:1px solid #26374e;font-size:12px}
+.item{padding:9px 0;border-bottom:1px solid #26374e;font-size:12px;overflow-wrap:anywhere}
 .item:last-child{border-bottom:0}
-.error{color:#ff8b96}
-.good{color:#55e0a6}
+.error{color:#ff8b96;white-space:pre-wrap}
 .muted{color:#9eafc7;font-size:12px}
-@media(max-width:700px){body{padding:12px}.columns{grid-template-columns:1fr}}
+@media(max-width:700px){body{padding:12px}.columns{grid-template-columns:1fr}.value{font-size:18px}}
 </style>
 </head>
 <body>
@@ -317,6 +385,7 @@ p{color:#aebbd0}
   </section>
 
   <p id="status">Conectando...</p>
+  <p class="muted" id="rpc"></p>
   <p class="muted" id="updated"></p>
   <p class="error" id="error"></p>
 
@@ -350,6 +419,7 @@ function safeText(value){
 async function load(){
   try{
     const response=await fetch("/api/state",{cache:"no-store"});
+    if(!response.ok)throw new Error("Falha ao consultar o estado do bot.");
     const s=await response.json();
 
     document.getElementById("price").textContent=
@@ -361,6 +431,8 @@ async function load(){
     document.getElementById("pnl").textContent=
       (s.resultado_usdt>=0?"+":"")+"$"+fmt(s.resultado_usdt,4);
     document.getElementById("status").textContent="Status: "+s.status;
+    document.getElementById("rpc").textContent=
+      s.rpc_usado?"RPC consultado: "+s.rpc_usado:"";
     document.getElementById("updated").textContent=
       s.ultima_atualizacao?"Última atualização: "+s.ultima_atualizacao:"";
     document.getElementById("error").textContent=s.last_error||"";
@@ -381,7 +453,8 @@ async function load(){
       '<div class="item">'+safeText(x)+'</div>'
     ).join("")||'<div class="muted">Aguardando registro.</div>';
   }catch(e){
-    document.getElementById("error").textContent="Não foi possível carregar o painel.";
+    document.getElementById("error").textContent=
+      "Não foi possível carregar o painel. Atualize a página.";
   }
 }
 load();
@@ -408,7 +481,6 @@ def iniciar_thread():
     thread = threading.Thread(target=loop_bot, daemon=True)
     thread.start()
 
-# Use um único worker Gunicorn para evitar iniciar várias cópias do bot.
 iniciar_thread()
 
 if __name__ == "__main__":
