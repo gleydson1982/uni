@@ -3,3 +3,4 @@ requests==2.31.0
 web3==6.11.1
 eth-account==0.10.0
 gunicorn==21.2.0
+setuptools<81
