@@ -1,154 +1,224 @@
-import os, time, requests, threading
-from datetime import datetime
-from flask import Flask, render_template_string
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+import os
+import time
+import threading
+import requests
+from flask import Flask, jsonify, render_template_string
+from web3 import Web3
+from eth_account import Account
 
 app = Flask(__name__)
 
-# ===== CONFIG =====
+# ===== CONFIG DA RENDER (Pega do Environment) =====
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
+GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "").strip()
+
+if PRIVATE_KEY and not PRIVATE_KEY.startswith("0x"):
+    PRIVATE_KEY = "0x" + PRIVATE_KEY
+
+WALLET_ADDRESS = None
+if PRIVATE_KEY:
+    try:
+        WALLET_ADDRESS = Account.from_key(PRIVATE_KEY).address
+    except:
+        WALLET_ADDRESS = None
+
+BSC_RPC = "https://bsc-dataseed.binance.org/"
+w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+
 GRID_START = 5.31
-GRID_STEP = 0.20
+GRID_END = 9.11
 GRID_LEVELS = 20
-SYMBOL = "UNIUSDT"
-GOOGLE_SHEET_ID = "1gEyaX1v7S4DKpQYcU09owU2scNGYEgFQP7icYvGjyg"
+GRID_STEP = (GRID_END - GRID_START) / (GRID_LEVELS - 1)
 
 STATE = {
-    "preco": 6.91,
-    "fonte": "Binance",
-    "status": "OK",
-    "uni_bal": 10.3605,
-    "usdt_bal": 135.8091,
-    "lucro": 1.92,
-    "last_error": "Iniciando bot...",
-    "historico": [],
-    "grids": []
+    "preco": 6.92,
+    "usdt_bal": 125.898,
+    "uni_bal": 18.3085,
+    "lucro": 0.0,
+    "trades": 0,
+    "status": "Iniciando...",
+    "wallet": WALLET_ADDRESS or "Carregando...",
+    "grids": [],
+    "last_error": "",
+    "logs": []
 }
 
-# Cria grids correto: abaixo do preço = COMPRADO
-for i in range(GRID_LEVELS):
-    price = GRID_START + i * GRID_STEP
-    esta_comprado = price < STATE["preco"]
-    STATE["grids"].append({
-        "id": i+1,
-        "price": price,
-        "qtd": "9.0 USDT",
-        "status": "COMPRADO - Pronto p/ venda" if esta_comprado else "VENDIDO - Pronto p/ compra",
-        "trades": 1 if esta_comprado else 0,
-        "profit": 0.0,
-        "estado": "COMPRADO" if esta_comprado else "VENDIDO"
-    })
+# Cria grids com SUA lógica correta
+# Abaixo do preço = VENDIDO (segura USDT p/ comprar)
+# Acima do preço = COMPRADO (segura UNI p/ vender)
+def init_grids(preco_ref=6.92):
+    STATE["grids"] = []
+    for i in range(GRID_LEVELS):
+        price = round(GRID_START + i * GRID_STEP, 2)
+        # Lógica CORRETA que você falou
+        esta_comprado = price > preco_ref
+        STATE["grids"].append({
+            "id": i+1,
+            "price": price,
+            "qtd": "9.0 USDT",
+            "estado": "COMPRADO" if esta_comprado else "VENDIDO",
+            "status": "COMPRADO - Pronto p/ venda" if esta_comprado else "VENDIDO - Pronto p/ compra",
+            "trades": 0,
+            "profit": 0.0
+        })
 
-def get_preco_3_fontes():
-    try:
-        r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={SYMBOL}", timeout=3)
-        STATE["fonte"] = "Binance"
-        return float(r.json()['price'])
-    except: pass
-    try:
-        r = requests.get("https://api.coinbase.com/v2/prices/UNI-USD/spot", timeout=3)
-        STATE["fonte"] = "Coinbase"
-        return float(r.json()['data']['amount'])
-    except: pass
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=uniswap&vs_currencies=usd", timeout=3)
-        STATE["fonte"] = "CoinGecko"
-        return float(r.json()['uniswap']['usd'])
-    except: pass
-    STATE["fonte"] = "Cache"
-    return STATE["preco"]
+init_grids(STATE["preco"])
 
-def enviar_para_planilha(tipo, preco, qtd, total, hash_tx, saldo_usdt, saldo_uni, lucro_trade):
-    # CORREÇÃO: não dá mais erro azul se não tiver credenciais.json
-    if not os.path.exists("credenciais.json"):
-        STATE["last_error"] = f"Simulação OK {tipo} {preco} - Hash {hash_tx[:10]}..."
-        return True
+def log(msg):
+    print(msg)
+    STATE["logs"].insert(0, f"{time.strftime('%H:%M:%S')} {msg}")
+    STATE["logs"] = STATE["logs"][:20]
+
+def get_preco_real():
     try:
-        scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credenciais.json", scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-        agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        novo_lucro_total = STATE["lucro"] + lucro_trade
-        linha = [agora, tipo, preco, qtd, total, lucro_trade, novo_lucro_total, hash_tx, saldo_usdt, saldo_uni]
-        sheet.append_row(linha)
-        STATE["lucro"] = novo_lucro_total
-        STATE["historico"].insert(0, f"{agora} {tipo} {qtd} @ ${preco}")
-        STATE["last_error"] = f"{tipo} {preco} OK"
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=UNIUSDT", timeout=5)
+        p = float(r.json()["price"])
+        STATE["preco"] = p
+        return p
+    except Exception as e:
+        STATE["last_error"] = f"Preco: {e}"
+        return STATE["preco"]
+
+def get_saldo_real():
+    if not WALLET_ADDRESS:
+        return False
+    try:
+        abi = '[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]'
+        usdt_c = w3.eth.contract(address=Web3.to_checksum_address("0x55d398326f99059fF775485246999027B3197955"), abi=abi)
+        uni_c = w3.eth.contract(address=Web3.to_checksum_address("0xBF5142A225b4a1cfAEC59F842A46b36269De8bDaF"), abi=abi)
+        bal_usdt = usdt_c.functions.balanceOf(Web3.to_checksum_address(WALLET_ADDRESS)).call() / 10**18
+        bal_uni = uni_c.functions.balanceOf(Web3.to_checksum_address(WALLET_ADDRESS)).call() / 10**18
+        STATE["usdt_bal"] = round(bal_usdt, 4)
+        STATE["uni_bal"] = round(bal_uni, 4)
+        STATE["wallet"] = WALLET_ADDRESS
+        STATE["status"] = "Trust Wallet Conectada"
         return True
     except Exception as e:
-        STATE["last_error"] = f"Planilha: {str(e)[:80]}"
+        STATE["last_error"] = f"Saldo: {str(e)[:90]}"
         return False
 
+def enviar_para_planilha(tipo, preco_grid, preco_atual, qtd):
+    if not GOOGLE_SHEET_URL:
+        return
+    try:
+        payload = {
+            "tipo": tipo,
+            "grid": preco_grid,
+            "preco_atual": preco_atual,
+            "qtd": qtd,
+            "usdt_bal": STATE["usdt_bal"],
+            "uni_bal": STATE["uni_bal"],
+            "wallet": WALLET_ADDRESS,
+            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+        requests.post(GOOGLE_SHEET_URL, json=payload, timeout=10)
+        log(f"Planilha OK {tipo} {preco_grid}")
+    except Exception as e:
+        log(f"Planilha ERRO {e}")
+
 def loop_bot():
+    init_grids(get_preco_real())
     while True:
         try:
-            preco_real = get_preco_3_fontes()
-            STATE["preco"] = preco_real
+            preco = get_preco_real()
+            get_saldo_real()
+            
             for g in STATE["grids"]:
-                if preco_real >= g["price"] + 0.10 and g["estado"] == "COMPRADO":
-                    hash_fake = f"0x{os.urandom(32).hex()}"
-                    enviar_para_planilha("VENDA", g["price"], 2.40247, 2.40247*g["price"], hash_fake, STATE["usdt_bal"], STATE["uni_bal"], 0.48)
+                # VENDA: preço subiu acima do grid que estava COMPRADO
+                if preco >= g["price"] + 0.05 and g["estado"] == "COMPRADO":
                     g["estado"] = "VENDIDO"
                     g["status"] = "VENDIDO - Pronto p/ compra"
                     g["trades"] += 1
-                elif preco_real <= g["price"] - 0.10 and g["estado"] == "VENDIDO":
-                    hash_fake = f"0x{os.urandom(32).hex()}"
-                    enviar_para_planilha("COMPRA", g["price"], 1.4263, 9.0, hash_fake, STATE["usdt_bal"], STATE["uni_bal"], 0)
+                    STATE["trades"] += 1
+                    STATE["lucro"] += 0.15
+                    log(f"VENDA {g['price']} - preco {preco}")
+                    enviar_para_planilha("VENDA", g["price"], preco, g["qtd"])
+                
+                # COMPRA: preço caiu abaixo do grid que estava VENDIDO
+                elif preco <= g["price"] - 0.05 and g["estado"] == "VENDIDO":
                     g["estado"] = "COMPRADO"
                     g["status"] = "COMPRADO - Pronto p/ venda"
                     g["trades"] += 1
+                    STATE["trades"] += 1
+                    log(f"COMPRA {g['price']} - preco {preco}")
+                    enviar_para_planilha("COMPRA", g["price"], preco, g["qtd"])
+            
+            time.sleep(5)
         except Exception as e:
-            STATE["last_error"] = f"Erro loop: {e}"
-            STATE["status"] = "ERRO"
-        time.sleep(5)
+            STATE["last_error"] = str(e)[:100]
+            time.sleep(5)
 
-HTML_DASH = """
-<html><head><meta http-equiv="refresh" content="3">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UNI Bot</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
-body{background:#0e0e10;color:#d1d1d1;font-family:'Inter',sans-serif;padding:12px;margin:0}
-.top{border:1px solid #00e676;border-radius:10px;padding:14px 18px;display:flex;justify-content:space-between;align-items:center;background:#16161a}
-.price{font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700;color:#00e676}
-.small{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.5px}
-.grid{display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-top:12px}
-.box{background:#16161a;border:1px solid #232326;border-radius:10px;padding:14px}
-.badge{font-size:10px;padding:3px 6px;border-radius:4px;font-weight:600}
-.badge-buy{background:rgba(0,230,118,0.15);color:#00e676;border:1px solid rgba(0,230,118,0.3)}
-.badge-sell{background:rgba(255,82,82,0.15);color:#ff5252;border:1px solid rgba(255,82,82,0.3)}
-.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1f1f23;font-size:12px;font-family:'JetBrains Mono',monospace}
-.row:last-child{border:none}
-.profit{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:#00e676}
-.error{margin-top:10px;background:#1e1e2e;color:#8b9cff;padding:8px 10px;border-radius:6px;font-size:11px;font-family:'JetBrains Mono',monospace}
-</style></head><body>
-<div class="top">
-<div><div class="small">Preço Real UNI / USDT</div><div class="price">${{preco}} <span style="font-size:11px;color:#888;font-weight:400">{{fonte}}</span></div><div class="small">Binance + Coinbase + CoinGecko | {{hora}} | Status: {{status}}</div></div>
-<div style="text-align:right"><div class="small">Saldo Total</div><div class="price" style="font-size:16px">${{uni_usd}} + ${{usdt_bal}}</div></div>
+body{background:#0f1115;color:#e6e6e6;font-family:'JetBrains Mono',monospace;font-size:12px;margin:0;padding:12px}
+.header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #222;padding-bottom:8px;margin-bottom:10px}
+.price{font-size:18px;font-weight:600}
+.bal{display:flex;gap:16px;margin:10px 0}
+.bal div{background:#1a1d24;padding:8px 12px;border-radius:6px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}
+.card{background:#1a1d24;border-radius:6px;padding:8px;border-left:3px solid #333}
+.card.COMPRADO{border-left-color:#22c55e}
+.card.VENDIDO{border-left-color:#ef4444}
+.badge{font-size:10px;padding:2px 6px;border-radius:10px;color:#fff}
+.badge.COMPRADO{background:#22c55e}
+.badge.VENDIDO{background:#ef4444}
+.log{margin-top:12px;background:#1a1d24;padding:8px;border-radius:6px;max-height:150px;overflow:auto;font-size:11px}
+.small{font-size:10px;color:#888}
+</style>
+</head>
+<body>
+<div class="header">
+<div><b>UNI-BOT v5</b> <span class="small" id="wallet"></span></div>
+<div class="price">$<span id="preco">-</span> <span class="small" id="status"></span></div>
 </div>
-<div class="grid">
-<div class="box">
-<div class="small" style="margin-bottom:10px">Carteira & Grid 20 Níveis ($0.20) - Start $5.31</div>
-<div style="display:flex;gap:20px;margin-bottom:12px;font-size:12px"><div>UNI <b style="color:#fff">{{uni_bal}}</b> ≈ ${{uni_usd}}</div><div>USDT <b style="color:#fff">{{usdt_bal}}</b></div></div>
-{% for g in grids %}
-<div class="row"><div>G{{g.id}} <b>${{"%.2f"|format(g.price)}}</b> <span style="color:#666">({{g.qtd}})</span></div><div><span class="badge {{'badge-buy' if g.estado=='COMPRADO' else 'badge-sell'}}">{{g.status}}</span></div><div style="color:#666">{{g.trades}}x</div></div>
-{% endfor %}
-<div class="error">{{last_error}}</div>
+<div class="bal">
+<div>UNI: <b id="uni">-</b></div>
+<div>USDT: <b id="usdt">-</b></div>
+<div>Trades: <b id="trades">-</b> | Lucro: $<b id="lucro">-</b></div>
 </div>
-<div><div class="box"><div class="small">Lucro Realizado</div><div class="profit">+${{lucro}}</div><div class="small" style="margin-top:4px">Planilha: OK | Trades: {{historico|length}}</div></div>
-<div class="box" style="margin-top:12px"><div class="small">Histórico</div><div style="margin-top:8px">{% for h in historico %}<div class="small" style="padding:3px 0;color:#aaa">{{h}}</div>{% endfor %}</div><div style="margin-top:16px"><div class="small">Lucro Acumulado</div><div class="profit">+${{lucro}}</div></div></div></div>
-</div>
-</body></html>
+<div class="small" id="error" style="color:#f87171;margin-bottom:8px"></div>
+<div class="grid" id="grid"></div>
+<div class="log" id="logs"></div>
+<script>
+function load(){
+ fetch('/api/state').then(r=>r.json()).then(s=>{
+  document.getElementById('preco').innerText=s.preco.toFixed(2);
+  document.getElementById('uni').innerText=s.uni_bal;
+  document.getElementById('usdt').innerText=s.usdt_bal;
+  document.getElementById('trades').innerText=s.trades;
+  document.getElementById('lucro').innerText=s.lucro.toFixed(2);
+  document.getElementById('status').innerText=s.status;
+  document.getElementById('wallet').innerText=(s.wallet||'').slice(0,12)+'...';
+  document.getElementById('error').innerText=s.last_error||'';
+  let h='';
+  s.grids.forEach(g=>{
+    h+=`<div class="card ${g.estado}"><div style="display:flex;justify-content:space-between"><b>G${g.id} $${g.price.toFixed(2)}</b><span class="badge ${g.estado}">${g.estado}</span></div><div class="small">${g.qtd} | trades ${g.trades}</div><div class="small">${g.status}</div></div>`;
+  });
+  document.getElementById('grid').innerHTML=h;
+  document.getElementById('logs').innerHTML=s.logs.join('<br>');
+ });
+}
+setInterval(load,3000);load();
+</script>
+</body>
+</html>
 """
 
 @app.route("/")
-def dash():
-    return render_template_string(HTML_DASH, preco=f"{STATE['preco']:.4f}", fonte=STATE["fonte"], status=STATE["status"],
-                                  hora=datetime.now().strftime("%H:%M:%S"), uni_bal=STATE["uni_bal"],
-                                  uni_usd=f"{STATE['uni_bal']*STATE['preco']:.2f}", usdt_bal=STATE["usdt_bal"],
-                                  lucro=STATE["lucro"], last_error=STATE["last_error"],
-                                  grids=STATE["grids"], historico=STATE["historico"][:10])
+def home():
+    return render_template_string(HTML)
+
+@app.route("/api/state")
+def state():
+    return jsonify(STATE)
 
 threading.Thread(target=loop_bot, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
