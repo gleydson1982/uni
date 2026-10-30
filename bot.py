@@ -1,136 +1,118 @@
-import os, json, time, threading, requests
+import os, time, threading, requests
 from flask import Flask
 from web3 import Web3
 
-BSC_RPCS = [
-    "https://bsc-dataseed1.binance.org",
-    "https://bsc-dataseed2.binance.org",
-    "https://bsc.meowrpc.com"
-]
-for rpc in BSC_RPCS:
+# --- CONFIG BSC ---
+RPC = "https://bsc-dataseed1.binance.org"
+w3 = Web3(Web3.HTTPProvider(RPC))
+
+# ENDERECOS 100% CORRETOS DA SUA TRANSACAO QUE FUNCIONOU
+# USDT que aparece na sua BscScan como Binance-Peg BSC-USD
+USDT = "0x55d398326f99059fF775485246999027B3197955"
+# UNI Binance-Peg UNI
+UNI = "0xbf5140a22578168fd20dcae126e236590a8d6bfa"
+# Pancake Router v2 que fez sua transacao
+PANCAKE_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+
+# --- CARTEIRA ---
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
+ACCOUNT = None
+try:
+    if PRIVATE_KEY and len(PRIVATE_KEY) > 10:
+        ACCOUNT = w3.eth.account.from_key(PRIVATE_KEY).address
+except Exception as e:
+    ACCOUNT = None
+
+# --- ESTADO DO DASHBOARD ---
+estado = {
+    "preco_real": None,
+    "fonte": "INICIANDO",
+    "bnb": 0.0,
+    "log": "Iniciando bot - pesquisando preco REAL"
+}
+
+def pega_preco_real():
+    """SEM CHUTE - SO PESQUISA REAL BINANCE / COINGECKO"""
     try:
-        w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 5}))
-        if w3.is_connected():
-            break
-    except:
-        continue
-
-PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
-ACCOUNT = w3.eth.account.from_key(PRIVATE_KEY).address if PRIVATE_KEY else ""
-
-USDT = Web3.to_checksum_address("0x55d398326f99059ff775485246999027b319dc7".lower())
-UNI = Web3.to_checksum_address("0xbf5140a22578168fd20dcae126e236590a8d6bfa".lower())
-ROUTER = Web3.to_checksum_address("0x10ed43c718714eb63d5aa57b78b54704e256024e".lower())
-
-GRID_BASE = 5.51
-GRID_STEP = 0.10
-GRID_N = 20
-VALOR_GRID = 9
-MIN_BNB = 0.0005
-
-estado = {"grids": {}, "preco_real": None, "bnb": 0, "ultimo_log": "", "fonte": "INICIANDO"}
-
-def log(m):
-    estado["ultimo_log"] = m
-    print(m, flush=True)
-
-def pega_preco_agora():
-    # SEM CHUTE - SO PESQUISA REAL
-    # 1 - Binance
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=UNIUSDT", timeout=4).json()
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=UNIUSDT", timeout=5).json()
         if 'price' in r:
             p = float(r['price'])
-            if 3 < p < 20:
-                estado["preco_real"] = p
-                estado["fonte"] = "Binance"
-                return p, "Binance", "OK"
-    except Exception as e:
-        pass
-    # 2 - Coinbase
-    try:
-        r = requests.get("https://api.exchange.coinbase.com/products/UNI-USD/ticker", timeout=4).json()
-        if 'price' in r:
-            p = float(r['price'])
-            if 3 < p < 20:
-                estado["preco_real"] = p
-                estado["fonte"] = "Coinbase"
-                return p, "Coinbase", "OK"
+            estado["preco_real"] = p
+            estado["fonte"] = "Binance"
+            return p, "Binance"
     except:
         pass
-    # 3 - CoinGecko
     try:
         r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=uniswap&vs_currencies=usd", timeout=5).json()
         p = float(r['uniswap']['usd'])
-        if 3 < p < 20:
-            estado["preco_real"] = p
-            estado["fonte"] = "CoinGecko"
-            return p, "CoinGecko", "OK"
+        estado["preco_real"] = p
+        estado["fonte"] = "CoinGecko"
+        return p, "CoinGecko"
     except:
         pass
-    # 4 - Se tudo falhar, usa o ULTIMO PRECO PESQUISADO (nao chute)
-    if estado.get("preco_real") and 3 < estado["preco_real"] < 20:
-        return estado["preco_real"], estado.get("fonte", "ULTIMO") + " (cache)", "CACHE"
-    
-    # 5 - Se nunca pesquisou nada ainda
-    return None, "SEM API", "FALHA"
+    if estado["preco_real"]:
+        return estado["preco_real"], estado["fonte"] + " (cache)"
+    return None, "SEM API"
 
-def get_bals():
-    try:
-        bnb = float(w3.from_wei(w3.eth.get_balance(ACCOUNT), 'ether')) if ACCOUNT else 0
-        abi = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
-        usdt_c = w3.eth.contract(address=USDT, abi=abi)
-        uni_c = w3.eth.contract(address=UNI, abi=abi)
-        usdt = usdt_c.functions.balanceOf(ACCOUNT).call() / 1e18 if ACCOUNT else 0
-        uni = uni_c.functions.balanceOf(ACCOUNT).call() / 1e18 if ACCOUNT else 0
-        estado["bnb"] = bnb
-        return bnb, usdt, uni
-    except Exception as e:
-        log(f"ERRO BAL {e}")
-        return estado.get("bnb",0), 0, 0
-
-def bot_loop():
-    while True:
-        try:
-            preco_data = pega_preco_agora()
-            preco = preco_data[0]
-            fonte = preco_data[1]
-            bnb, usdt, uni = get_bals()
-            if preco is None:
-                log(f"AGUARDANDO API REAL - Binance/CoinGecko fora - tentando de novo em 15s")
-                time.sleep(15)
-                continue
-            if bnb < MIN_BNB:
-                log(f"TRAVADO BNB {bnb:.4f} < {MIN_BNB}")
-                time.sleep(60)
-                continue
-            log(f"PRECO REAL ${preco:.2f} ({fonte}) | BNB:{bnb:.4f}")
-        except Exception as e:
-            log(f"ERRO LOOP {e}")
-        time.sleep(15)
-
+# --- FLASK DASHBOARD ---
 app = Flask(__name__)
 
 @app.route("/")
-@app.route("/dashboard")
 def dashboard():
-    preco, fonte, status = pega_preco_agora()
-    bnb = estado.get("bnb",0)
+    preco, fonte = pega_preco_real()
+    
     if preco is None:
-        preco_txt = "PESQUISANDO PRECO REAL..."
-        grids_html = "<p>Aguardando Binance/CoinGecko responder - sem chute</p>"
+        titulo = "PESQUISANDO PRECO REAL... (Binance/CoinGecko)"
+        grid_html = "<p style='color:yellow'>Aguardando API real - sem chute de $6.47 / $7.37</p>"
     else:
-        preco_txt = f"${preco:.2f} ({fonte})"
-        grids_html = ""
-        for i in range(GRID_N):
-            p = GRID_BASE + i*GRID_STEP
-            status_grid = "VENDIDO" if preco > p else "COMPRADO"
-            cor = "#ff4444" if status_grid=="VENDIDO" else "#44ff44"
-            qtd = f"{VALOR_GRID} USDT" if status_grid=="COMPRADO" else "0 USDT"
-            grids_html += f"<div style='border:1px solid #333;padding:5px;margin:2px'>G{i} ${p:.2f} ({qtd}) <span style='color:{cor}'>{status_grid}</span></div>"
+        titulo = f"${preco:.2f} - PESQUISA REAL ({fonte})"
+        grid_html = ""
+        for i in range(20):
+            preco_grid = 5.51 + (i * 0.10) # Grids de 5.51 ate 7.41
+            status = "VENDIDO" if preco > preco_grid else "COMPRADO"
+            cor = "#ff4444" if status == "VENDIDO" else "#44ff44"
+            grid_html += f"<div style='border:1px solid #333;padding:6px;margin:3px;background:#222'>Grid {i}: ${preco_grid:.2f} <b style='color:{cor}'>{status}</b></div>"
 
-    return f"<html><body style='background:#111;color:#fff;font-family:monospace;padding:20px'><h2>UNI BOT - PRECO REAL {preco_txt}</h2><p>BNB: {bnb:.4f} | {estado.get('ultimo_log','')}</p><h3>GRID 20 - Base ${GRID_BASE}</h3><div style='display:grid;grid-template-columns:1fr 1fr'>{grids_html}</div></body></html>"
+    bnb_txt = f"{estado['bnb']:.6f}" if estado['bnb'] else "0.000000"
+    conta_txt = ACCOUNT if ACCOUNT else "PRIVATE_KEY nao configurada"
+
+    return f"""
+    <html><head><meta http-equiv="refresh" content="10"></head>
+    <body style="background:#111;color:#fff;font-family:monospace;padding:20px">
+        <h2>UNI BOT V5 - {titulo}</h2>
+        <p>Conta: {conta_txt} | BNB: {bnb_txt}</p>
+        <p>Log: {estado['log']}</p>
+        <p>Transacao referencia que funcionou: 0x6dd6ab70b4858dd5a176abb1550a17417951dab5e4dafcf6cccef506477a3fb1</p>
+        <p>Router: {PANCAKE_ROUTER}</p>
+        <hr>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr">{grid_html}</div>
+    </body></html>
+    """
+
+# --- LOOP DO BOT ---
+def bot_loop():
+    while True:
+        try:
+            preco, fonte = pega_preco_real()
+            estado["fonte"] = fonte
+            if preco:
+                estado["log"] = f"Preco REAL pesquisado: ${preco:.4f} ({fonte}) - Rota USDT->WBNB->UNI igual da Trust Wallet"
+            else:
+                estado["log"] = "Sem API ainda, tentando de novo..."
+            
+            if ACCOUNT:
+                try:
+                    bal = w3.eth.get_balance(ACCOUNT)
+                    estado["bnb"] = float(w3.from_wei(bal, 'ether'))
+                except:
+                    pass
+        except Exception as e:
+            estado["log"] = f"Erro loop: {str(e)[:100]}"
+        time.sleep(15)
 
 threading.Thread(target=bot_loop, daemon=True).start()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
