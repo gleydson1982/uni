@@ -1,6 +1,8 @@
+import copy
+import json
 import os
-import time
 import threading
+import time
 from datetime import datetime
 
 from flask import Flask, jsonify, render_template_string
@@ -8,539 +10,536 @@ from web3 import Web3
 
 app = Flask(__name__)
 
-# PancakeSwap V2 e tokens na BNB Smart Chain.
-FACTORY_ADDRESS = Web3.to_checksum_address(
-    "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
-)
-UNI_ADDRESS = Web3.to_checksum_address(
-    "0xBf5140A22578168FD562DCcF235E5D43A02ce9B1"
-)
-USDT_ADDRESS = Web3.to_checksum_address(
-    "0x55d398326f99059fF775485246999027B3197955"
-)
-WBNB_ADDRESS = Web3.to_checksum_address(
-    "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+# Modo de teste: este arquivo não assina nem envia transações.
+# A chave privada não é lida pelo código.
+CHAIN_ID = 56
+POLL_SECONDS = 12
+
+CAPITAL_USDT = 1.00
+GRID_LEVELS = 5
+GRID_RANGE = 0.05
+ORDER_USDT = CAPITAL_USDT / GRID_LEVELS
+MAX_LOSS_USDT = 0.10
+SLIPPAGE_PERCENT = 0.01
+ESTIMATED_FEE_RATE = 0.003
+
+ROUTER = Web3.to_checksum_address("0x10ED43C718714eB63B5aA57B78B54704E256024E")
+UNI = Web3.to_checksum_address("0xBf5140A22578168FD562DCcF235E5D43A02ce9B1")
+USDT = Web3.to_checksum_address("0x55d398326f99059fF775485246999027B3197955")
+WBNB = Web3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")
+
+# Endereço público usado somente para consultar saldos. Nenhuma transação é enviada.
+READ_ONLY_WALLET = Web3.to_checksum_address(
+    os.getenv("READ_ONLY_WALLET", "0x8AEE0c5120f326C2389E3B6affa39E3BEBe82Fd3")
 )
 
-# Pode receber um RPC próprio em BSC_RPC_URL.
-# Se não for definido ou falhar, o bot tenta os RPCs públicos.
-RPC_URLS = [
-    os.getenv("BSC_RPC_URL", "").strip(),
+RPC_URLS = []
+custom_rpc = os.getenv("BSC_RPC_URL", "").strip()
+if custom_rpc:
+    RPC_URLS.append(custom_rpc)
+
+RPC_URLS.extend([
     "https://bsc-dataseed.binance.org/",
     "https://bsc-dataseed1.binance.org/",
     "https://bsc-dataseed2.binance.org/",
-    "https://bsc-dataseed3.binance.org/",
-    "https://bsc-dataseed4.binance.org/",
     "https://bsc-rpc.publicnode.com",
-    "https://1rpc.io/bnb",
-]
-RPC_URLS = list(dict.fromkeys(url for url in RPC_URLS if url))
+])
 
-CAPITAL_USDT = 1.00
-NIVEIS = 5
-FAIXA_PERCENTUAL = 0.05
-ORDEM_USDT = 0.10
-SLIPPAGE_PERCENTUAL = 0.01
-CUSTO_ESTIMADO_PERCENTUAL = 0.003
-PERDA_MAXIMA_USDT = 0.10
-INTERVALO_SEGUNDOS = 30
-TEMPO_LIMITE_RPC = 12
+# Remove URLs repetidas, mantendo a ordem.
+RPC_URLS = list(dict.fromkeys(RPC_URLS))
+STATE_FILE = os.getenv("SIM_STATE_FILE", "estado_simulacao.json")
 
-FACTORY_ABI = [
+ROUTER_ABI = [
     {
         "inputs": [
-            {"internalType": "address", "name": "tokenA", "type": "address"},
-            {"internalType": "address", "name": "tokenB", "type": "address"},
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+            {"internalType": "address[]", "name": "path", "type": "address[]"},
         ],
-        "name": "getPair",
-        "outputs": [{"internalType": "address", "name": "pair", "type": "address"}],
+        "name": "getAmountsOut",
+        "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}],
         "stateMutability": "view",
         "type": "function",
     }
-]
-
-PAIR_ABI = [
-    {
-        "inputs": [],
-        "name": "token0",
-        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [],
-        "name": "getReserves",
-        "outputs": [
-            {"internalType": "uint112", "name": "reserve0", "type": "uint112"},
-            {"internalType": "uint112", "name": "reserve1", "type": "uint112"},
-            {"internalType": "uint32", "name": "blockTimestampLast", "type": "uint32"},
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    },
 ]
 
 ERC20_ABI = [
     {
+        "constant": True,
         "inputs": [],
         "name": "decimals",
-        "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
-        "stateMutability": "view",
+        "outputs": [{"name": "", "type": "uint8"}],
         "type": "function",
-    }
+    },
+    {
+        "constant": True,
+        "inputs": [{"name": "_owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "type": "function",
+    },
 ]
 
-lock = threading.RLock()
+STATE_LOCK = threading.RLock()
 
-STATE = {
-    "status": "Iniciando consulta da BNB Chain",
-    "preco": None,
-    "preco_referencia": None,
-    "saldo_usdt_virtual": 0.0,
-    "saldo_uni_virtual": 0.0,
-    "resultado_usdt": 0.0,
-    "valor_carteira_virtual": 0.0,
-    "trades": 0,
-    "perda_maxima_usdt": PERDA_MAXIMA_USDT,
-    "parado_por_limite": False,
-    "ultima_atualizacao": None,
-    "last_error": "",
-    "rpc_usado": "",
-    "rota_usada": "",
-    "grids": [],
-    "logs": [],
-    "historico": [],
-}
+def fresh_state():
+    return {
+        "mode": "SIMULAÇÃO",
+        "reference_price": None,
+        "price": None,
+        "price_route": "",
+        "last_price": None,
+        "rpc": "",
+        "wallet": READ_ONLY_WALLET,
+        "wallet_balances": {"bnb": None, "uni": None, "usdt": None},
+        "virtual_usdt": CAPITAL_USDT,
+        "virtual_uni": 0.0,
+        "equity": CAPITAL_USDT,
+        "pnl_total": 0.0,
+        "pnl_realized": 0.0,
+        "pnl_unrealized": 0.0,
+        "grids": [],
+        "trades": [],
+        "stopped": False,
+        "message": "Aguardando consulta inicial da BNB Chain.",
+        "last_error": "",
+        "updated_at": "",
+    }
 
-def log(mensagem):
-    registro = f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')} · {mensagem}"
-    with lock:
-        STATE["logs"].insert(0, registro)
-        STATE["logs"] = STATE["logs"][:30]
-    print(registro, flush=True)
-
-def nome_rpc(url):
-    return url.split("://", 1)[-1].split("/", 1)[0]
-
-def verificar_endereco(cliente, nome, endereco):
-    codigo = cliente.eth.get_code(endereco)
-    if len(bytes(codigo)) == 0:
-        raise ValueError(
-            f"Não foi encontrado código de contrato para {nome} na BNB Chain."
-        )
-
-def obter_decimais(cliente, endereco):
-    contrato = cliente.eth.contract(address=endereco, abi=ERC20_ABI)
-    return int(contrato.functions.decimals().call())
-
-def preco_no_par(cliente, factory, token_a, token_b, decimais_a, decimais_b):
-    endereco_par = factory.functions.getPair(token_a, token_b).call()
-
-    if endereco_par.lower() == "0x0000000000000000000000000000000000000000":
-        raise ValueError("Não existe pool V2 para esse par.")
-
-    endereco_par = Web3.to_checksum_address(endereco_par)
-    contrato_par = cliente.eth.contract(address=endereco_par, abi=PAIR_ABI)
-    endereco_token0 = contrato_par.functions.token0().call()
-    reserva0, reserva1, _ = contrato_par.functions.getReserves().call()
-
-    if reserva0 <= 0 or reserva1 <= 0:
-        raise ValueError("O pool existe, mas não tem reservas disponíveis.")
-
-    token0_e_a = endereco_token0.lower() == token_a.lower()
-
-    if token0_e_a:
-        reserva_a = reserva0 / (10 ** decimais_a)
-        reserva_b = reserva1 / (10 ** decimais_b)
-    else:
-        reserva_a = reserva1 / (10 ** decimais_a)
-        reserva_b = reserva0 / (10 ** decimais_b)
-
-    if reserva_a <= 0 or reserva_b <= 0:
-        raise ValueError("As reservas do pool retornaram um valor inválido.")
-
-    return reserva_b / reserva_a
-
-def obter_preco_em_rpc(url):
-    cliente = Web3(
-        Web3.HTTPProvider(
-            url,
-            request_kwargs={"timeout": TEMPO_LIMITE_RPC},
-        )
-    )
-
-    if not cliente.is_connected():
-        raise ConnectionError("Não foi possível conectar a este RPC.")
-
-    chain_id = cliente.eth.chain_id
-    if chain_id != 56:
-        raise ConnectionError(
-            f"O RPC respondeu pela rede {chain_id}, não pela BNB Smart Chain."
-        )
-
-    verificar_endereco(cliente, "Factory PancakeSwap V2", FACTORY_ADDRESS)
-    verificar_endereco(cliente, "UNI", UNI_ADDRESS)
-    verificar_endereco(cliente, "USDT", USDT_ADDRESS)
-    verificar_endereco(cliente, "WBNB", WBNB_ADDRESS)
-
-    factory = cliente.eth.contract(address=FACTORY_ADDRESS, abi=FACTORY_ABI)
-
-    decimais_uni = obter_decimais(cliente, UNI_ADDRESS)
-    decimais_usdt = obter_decimais(cliente, USDT_ADDRESS)
-    decimais_wbnb = obter_decimais(cliente, WBNB_ADDRESS)
-
+def load_state():
+    state = fresh_state()
     try:
-        preco = preco_no_par(
-            cliente,
-            factory,
-            UNI_ADDRESS,
-            USDT_ADDRESS,
-            decimais_uni,
-            decimais_usdt,
-        )
-        return preco, "UNI/USDT direto"
-    except Exception as erro_direto:
-        erro_direto = str(erro_direto)
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
+            saved = json.load(file)
 
+        # Só recupera estado criado por esta versão do simulador.
+        if (
+            saved.get("mode") == "SIMULAÇÃO"
+            and isinstance(saved.get("grids"), list)
+            and len(saved.get("grids")) == GRID_LEVELS
+            and saved.get("reference_price") is not None
+        ):
+            state.update(saved)
+    except (OSError, ValueError, TypeError):
+        pass
+    return state
+
+STATE = load_state()
+
+def save_state():
     try:
-        preco_uni_wbnb = preco_no_par(
-            cliente,
-            factory,
-            UNI_ADDRESS,
-            WBNB_ADDRESS,
-            decimais_uni,
-            decimais_wbnb,
-        )
-        preco_wbnb_usdt = preco_no_par(
-            cliente,
-            factory,
-            WBNB_ADDRESS,
-            USDT_ADDRESS,
-            decimais_wbnb,
-            decimais_usdt,
-        )
-        return preco_uni_wbnb * preco_wbnb_usdt, "UNI/WBNB → WBNB/USDT"
-    except Exception as erro_rota:
-        raise RuntimeError(
-            "Não foi possível obter cotação nem pelo pool direto UNI/USDT "
-            "nem pela rota via WBNB. "
-            f"Direto: {erro_direto[:180]} | Via WBNB: {str(erro_rota)[:180]}"
-        )
+        temporary_file = STATE_FILE + ".tmp"
+        with open(temporary_file, "w", encoding="utf-8") as file:
+            json.dump(STATE, file, ensure_ascii=False)
+        os.replace(temporary_file, STATE_FILE)
+    except Exception as error:
+        print(f"Não foi possível salvar o estado da simulação: {error}")
 
-def obter_preco_uni_usdt():
-    erros = []
-
+def connect_bsc():
+    errors = []
     for url in RPC_URLS:
-        servidor = nome_rpc(url)
         try:
-            preco, rota = obter_preco_em_rpc(url)
-            with lock:
-                STATE["rpc_usado"] = servidor
-                STATE["rota_usada"] = rota
-            return preco
-        except Exception as erro:
-            erros.append(f"{servidor}: {str(erro)[:250]}")
+            w3 = Web3(
+                Web3.HTTPProvider(
+                    url,
+                    request_kwargs={"timeout": 8},
+                )
+            )
+            if not w3.is_connected():
+                errors.append(f"{url}: sem conexão")
+                continue
 
-    raise ConnectionError(
-        "Todos os RPCs falharam. " + " || ".join(erros)
-    )
+            chain_id = w3.eth.chain_id
+            if chain_id != CHAIN_ID:
+                errors.append(f"{url}: rede inesperada ({chain_id})")
+                continue
 
-def calcular_resultado():
-    preco = STATE["preco"]
-    if preco is None:
-        return
+            router_code = w3.eth.get_code(ROUTER)
+            if not router_code:
+                errors.append(f"{url}: contrato do roteador não encontrado")
+                continue
 
-    valor = (
-        STATE["saldo_usdt_virtual"]
-        + STATE["saldo_uni_virtual"] * preco
-    )
-    resultado = valor - CAPITAL_USDT
+            return w3, url
+        except Exception as error:
+            errors.append(f"{url}: {str(error)[:100]}")
 
-    STATE["valor_carteira_virtual"] = valor
-    STATE["resultado_usdt"] = resultado
+    raise RuntimeError("Nenhuma RPC da BNB Chain respondeu corretamente. " + " | ".join(errors[:3]))
 
-    if resultado <= -PERDA_MAXIMA_USDT:
-        STATE["parado_por_limite"] = True
-        STATE["status"] = "Parado pelo limite de perda simulada"
+def get_price(w3):
+    uni_contract = w3.eth.contract(address=UNI, abi=ERC20_ABI)
+    usdt_contract = w3.eth.contract(address=USDT, abi=ERC20_ABI)
+    router_contract = w3.eth.contract(address=ROUTER, abi=ROUTER_ABI)
 
-def iniciar_carteira_virtual(preco):
-    STATE["preco_referencia"] = preco
-    STATE["saldo_usdt_virtual"] = CAPITAL_USDT / 2
-    STATE["saldo_uni_virtual"] = (CAPITAL_USDT / 2) / preco
+    uni_decimals = uni_contract.functions.decimals().call()
+    usdt_decimals = usdt_contract.functions.decimals().call()
+    one_uni = 10 ** uni_decimals
 
-    minimo = preco * (1 - FAIXA_PERCENTUAL)
-    maximo = preco * (1 + FAIXA_PERCENTUAL)
-    passo = (maximo - minimo) / (NIVEIS - 1)
-
-    STATE["grids"] = [
-        {
-            "id": indice + 1,
-            "preco": minimo + indice * passo,
-            "operacoes": 0,
-            "ultima_operacao": "Aguardando cruzamento",
-        }
-        for indice in range(NIVEIS)
+    routes = [
+        [UNI, USDT],
+        [UNI, WBNB, USDT],
     ]
+    errors = []
 
-    calcular_resultado()
-    log(f"Simulação iniciada. Preço de referência: ${preco:.6f}.")
+    for route in routes:
+        try:
+            amounts = router_contract.functions.getAmountsOut(one_uni, route).call()
+            if amounts and amounts[-1] > 0:
+                price = amounts[-1] / (10 ** usdt_decimals)
+                route_name = "UNI/USDT" if len(route) == 2 else "UNI/WBNB/USDT"
+                return float(price), route_name
+        except Exception as error:
+            errors.append(str(error)[:120])
 
-def registrar_operacao(tipo, nivel, preco):
-    custo = CUSTO_ESTIMADO_PERCENTUAL
-    slippage = SLIPPAGE_PERCENTUAL
-
-    if tipo == "COMPRA":
-        valor = min(ORDEM_USDT, STATE["saldo_usdt_virtual"])
-        if valor <= 0:
-            return
-
-        preco_execucao = preco * (1 + slippage)
-        quantidade = (valor * (1 - custo)) / preco_execucao
-
-        STATE["saldo_usdt_virtual"] -= valor
-        STATE["saldo_uni_virtual"] += quantidade
-        descricao = f"Compra simulada de {quantidade:.8f} UNI"
-    else:
-        preco_execucao = preco * (1 - slippage)
-        quantidade_desejada = ORDEM_USDT / preco_execucao
-        quantidade = min(quantidade_desejada, STATE["saldo_uni_virtual"])
-
-        if quantidade <= 0:
-            return
-
-        valor_liquido = quantidade * preco_execucao * (1 - custo)
-        STATE["saldo_uni_virtual"] -= quantidade
-        STATE["saldo_usdt_virtual"] += valor_liquido
-        descricao = f"Venda simulada de {quantidade:.8f} UNI"
-
-    STATE["trades"] += 1
-    grid = STATE["grids"][nivel]
-    grid["operacoes"] += 1
-    grid["ultima_operacao"] = tipo
-
-    STATE["historico"].insert(
-        0,
-        {
-            "hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-            "tipo": tipo,
-            "nivel": nivel + 1,
-            "preco": preco,
-            "descricao": descricao,
-            "observacao": "Simulação; nenhuma transação real foi enviada.",
-        },
-    )
-    STATE["historico"] = STATE["historico"][:50]
-
-    log(
-        f"{tipo} simulada no nível G{nivel + 1}, "
-        f"preço de referência ${preco:.6f}."
+    raise RuntimeError(
+        "Não foi possível obter cotação na PancakeSwap. "
+        + (" | ".join(errors) if errors else "A rota não retornou preço.")
     )
 
-def processar_movimento(preco_anterior, preco_atual):
-    if STATE["parado_por_limite"]:
+def get_wallet_balances(w3):
+    uni_contract = w3.eth.contract(address=UNI, abi=ERC20_ABI)
+    usdt_contract = w3.eth.contract(address=USDT, abi=ERC20_ABI)
+
+    bnb_balance = w3.eth.get_balance(READ_ONLY_WALLET) / 10**18
+    uni_decimals = uni_contract.functions.decimals().call()
+    usdt_decimals = usdt_contract.functions.decimals().call()
+
+    uni_balance = (
+        uni_contract.functions.balanceOf(READ_ONLY_WALLET).call()
+        / (10 ** uni_decimals)
+    )
+    usdt_balance = (
+        usdt_contract.functions.balanceOf(READ_ONLY_WALLET).call()
+        / (10 ** usdt_decimals)
+    )
+
+    return {
+        "bnb": float(bnb_balance),
+        "uni": float(uni_balance),
+        "usdt": float(usdt_balance),
+    }
+
+def initialize_grid(reference_price):
+    # Cinco intervalos de 2%, do limite de -5% ao limite de +5%.
+    step_fraction = (2 * GRID_RANGE) / GRID_LEVELS
+    grids = []
+
+    for index in range(GRID_LEVELS):
+        buy_fraction = -GRID_RANGE + index * step_fraction
+        sell_fraction = buy_fraction + step_fraction
+
+        grids.append({
+            "n": index + 1,
+            "buy_price": reference_price * (1 + buy_fraction),
+            "sell_price": reference_price * (1 + sell_fraction),
+            "status": "Aguardando queda",
+            "units": 0.0,
+            "cost": 0.0,
+            "entry_price": None,
+        })
+
+    return grids
+
+def update_simulation(price):
+    if STATE["reference_price"] is None:
+        STATE["reference_price"] = price
+        STATE["grids"] = initialize_grid(price)
+        STATE["last_price"] = price
+        STATE["message"] = "Cotação inicial registrada. Simulação pronta."
         return
 
-    for indice, grid in enumerate(STATE["grids"]):
-        nivel = grid["preco"]
+    previous_price = STATE.get("last_price")
+    if previous_price is None:
+        STATE["last_price"] = price
+        return
 
-        if preco_anterior > nivel and preco_atual <= nivel:
-            registrar_operacao("COMPRA", indice, preco_atual)
-        elif preco_anterior < nivel and preco_atual >= nivel:
-            registrar_operacao("VENDA", indice, preco_atual)
+    if STATE["stopped"]:
+        STATE["last_price"] = price
+        STATE["message"] = f"Simulação parada: limite de perda de US$ {MAX_LOSS_USDT:.2f} atingido."
+        return
 
-        if STATE["parado_por_limite"]:
-            break
+    # Simula vendas ao cruzar o preço-alvo de cada nível.
+    for grid in STATE["grids"]:
+        if (
+            grid["units"] > 0
+            and previous_price < grid["sell_price"] <= price
+        ):
+            proceeds = grid["units"] * price * (1 - ESTIMATED_FEE_RATE)
+            trade_pnl = proceeds - grid["cost"]
 
-def atualizar_cotacao():
-    preco_novo = obter_preco_uni_usdt()
+            STATE["virtual_usdt"] += proceeds
+            STATE["virtual_uni"] -= grid["units"]
+            STATE["pnl_realized"] += trade_pnl
 
-    if preco_novo <= 0:
-        raise ValueError("A cotação retornada não é positiva.")
+            STATE["trades"].insert(0, {
+                "time": datetime.now().strftime("%d/%m %H:%M:%S"),
+                "type": "VENDA simulada",
+                "price": price,
+                "quantity": grid["units"],
+                "pnl": trade_pnl,
+            })
 
-    with lock:
-        preco_anterior = STATE["preco"]
-        STATE["preco"] = preco_novo
-        STATE["ultima_atualizacao"] = datetime.now().strftime(
-            "%d/%m/%Y %H:%M:%S"
-        )
-        STATE["last_error"] = ""
+            grid["units"] = 0.0
+            grid["cost"] = 0.0
+            grid["entry_price"] = None
+            grid["status"] = "Aguardando nova queda"
 
-        if STATE["preco_referencia"] is None:
-            iniciar_carteira_virtual(preco_novo)
-        elif preco_anterior is not None:
-            processar_movimento(preco_anterior, preco_novo)
+    # Simula compras de US$ 0,20 ao cruzar cada nível para baixo.
+    for grid in STATE["grids"]:
+        crossed_down = previous_price > grid["buy_price"] >= price
+        if crossed_down and grid["units"] <= 0:
+            if STATE["virtual_usdt"] + 1e-9 < ORDER_USDT:
+                grid["status"] = "Saldo virtual insuficiente"
+                continue
 
-        calcular_resultado()
+            spend = ORDER_USDT
+            units = (spend * (1 - ESTIMATED_FEE_RATE)) / price
 
-        if not STATE["parado_por_limite"]:
-            STATE["status"] = "Monitorando em modo de simulação"
+            STATE["virtual_usdt"] -= spend
+            STATE["virtual_uni"] += units
 
-    return preco_novo
+            grid["units"] = units
+            grid["cost"] = spend
+            grid["entry_price"] = price
+            grid["status"] = "Comprado na simulação"
 
-def loop_bot():
-    log("Monitoramento iniciado em modo de simulação. Sem transações reais.")
+            STATE["trades"].insert(0, {
+                "time": datetime.now().strftime("%d/%m %H:%M:%S"),
+                "type": "COMPRA simulada",
+                "price": price,
+                "quantity": units,
+                "pnl": 0.0,
+            })
 
+    STATE["trades"] = STATE["trades"][:20]
+
+    open_value = sum(
+        grid["units"] * price
+        for grid in STATE["grids"]
+        if grid["units"] > 0
+    )
+    open_cost = sum(
+        grid["cost"]
+        for grid in STATE["grids"]
+        if grid["units"] > 0
+    )
+
+    STATE["virtual_uni"] = sum(grid["units"] for grid in STATE["grids"])
+    STATE["equity"] = STATE["virtual_usdt"] + open_value
+    STATE["pnl_unrealized"] = open_value - open_cost
+    STATE["pnl_total"] = STATE["equity"] - CAPITAL_USDT
+
+    if STATE["pnl_total"] <= -MAX_LOSS_USDT:
+        STATE["stopped"] = True
+        STATE["message"] = f"Simulação parada: perda limite de US$ {MAX_LOSS_USDT:.2f} atingida."
+    else:
+        STATE["message"] = "Simulação ativa. Nenhuma compra ou venda real é enviada."
+
+    STATE["last_price"] = price
+
+def monitoring_loop():
     while True:
         try:
-            preco = atualizar_cotacao()
-            log(f"Preço consultado: ${preco:.6f} USDT por UNI.")
-        except Exception as erro:
-            mensagem = str(erro)[:1200]
-            with lock:
-                STATE["last_error"] = mensagem
-                if not STATE["parado_por_limite"]:
-                    STATE["status"] = "Erro ao consultar preço"
-            log(f"Falha na consulta de preço: {mensagem}")
+            w3, rpc_url = connect_bsc()
+            price, route_name = get_price(w3)
+            balances = get_wallet_balances(w3)
 
-        time.sleep(INTERVALO_SEGUNDOS)
+            with STATE_LOCK:
+                STATE["price"] = price
+                STATE["price_route"] = route_name
+                STATE["rpc"] = rpc_url
+                STATE["wallet_balances"] = balances
+                STATE["updated_at"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                STATE["last_error"] = ""
+
+                update_simulation(price)
+                save_state()
+
+            print(
+                f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')} "
+                f"Preço UNI: ${price:.6f} | Fonte: {route_name} | "
+                f"Modo: simulação"
+            )
+        except Exception as error:
+            with STATE_LOCK:
+                STATE["last_error"] = str(error)[:500]
+                STATE["message"] = "Falha ao consultar a BNB Chain; sem preço substituto."
+                STATE["updated_at"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                save_state()
+            print(f"Erro de monitoramento: {error}")
+
+        time.sleep(POLL_SECONDS)
+
+def display_state():
+    with STATE_LOCK:
+        data = copy.deepcopy(STATE)
+
+    data["price_text"] = (
+        f"${data['price']:.6f}" if data["price"] is not None else "Aguardando"
+    )
+    data["reference_text"] = (
+        f"${data['reference_price']:.6f}"
+        if data["reference_price"] is not None else "Aguardando cotação"
+    )
+
+    balances = data["wallet_balances"]
+    data["bnb_text"] = f"{balances['bnb']:.6f} BNB" if balances["bnb"] is not None else "Aguardando"
+    data["uni_text"] = f"{balances['uni']:.6f} UNI" if balances["uni"] is not None else "Aguardando"
+    data["usdt_text"] = f"{balances['usdt']:.4f} USDT" if balances["usdt"] is not None else "Aguardando"
+
+    data["virtual_usdt_text"] = f"${data['virtual_usdt']:.4f}"
+    data["virtual_uni_text"] = f"{data['virtual_uni']:.6f} UNI"
+    data["equity_text"] = f"${data['equity']:.4f}"
+    data["pnl_text"] = f"${data['pnl_total']:+.4f}"
+
+    for grid in data["grids"]:
+        grid["buy_text"] = f"${grid['buy_price']:.6f}"
+        grid["sell_text"] = f"${grid['sell_price']:.6f}"
+
+    for trade in data["trades"]:
+        trade["price_text"] = f"${trade['price']:.6f}"
+        trade["quantity_text"] = f"{trade['quantity']:.6f} UNI"
+        trade["pnl_text"] = f"${trade['pnl']:+.4f}"
+
+    return data
 
 HTML = """
 <!doctype html>
 <html lang="pt-BR">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>UNI Grid · Simulação</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;padding:20px;background:#0b1220;color:#e8eef8;font:14px Arial,sans-serif}
-main{max-width:1100px;margin:auto}
-h1{margin:0 0 5px;font-size:23px}
-h2{font-size:17px;margin:0 0 10px}
-p{color:#aebbd0;overflow-wrap:anywhere}
-.notice{padding:12px;border:1px solid #76602d;background:#211d12;border-radius:9px;color:#f3dda1;margin:16px 0}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
-.card,.box{background:#121e30;border:1px solid #283a54;border-radius:10px;padding:14px;min-width:0}
-.label{color:#9eafc7;font-size:12px}
-.value{display:block;font-size:20px;font-weight:bold;margin-top:7px;overflow-wrap:anywhere}
-.columns{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
-.item{padding:9px 0;border-bottom:1px solid #26374e;font-size:12px;overflow-wrap:anywhere}
-.item:last-child{border-bottom:0}
-.error{color:#ff8b96;white-space:pre-wrap}
-.muted{color:#9eafc7;font-size:12px;overflow-wrap:anywhere}
-@media(max-width:700px){body{padding:12px}.columns{grid-template-columns:1fr}.value{font-size:18px}}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="12">
+  <title>UNI Grid | Simulação</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#0b1020;color:#e8edf7;font-family:Arial,sans-serif}
+    main{max-width:1100px;margin:auto;padding:20px}
+    h1{font-size:24px;margin:0 0 6px}
+    .muted{color:#9aa8c0;font-size:13px}
+    .notice{margin:16px 0;padding:14px;border:1px solid #e0a52b;background:#2a2111;border-radius:12px;color:#ffe1a1;line-height:1.5}
+    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+    .card,.panel{background:#141c2e;border:1px solid #26344c;border-radius:14px;padding:16px}
+    .label{color:#9aa8c0;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+    .value{font-size:24px;font-weight:700;margin-top:8px;overflow-wrap:anywhere}
+    .panel{margin-top:14px}
+    h2{font-size:17px;margin:0 0 12px}
+    .status{padding:10px 12px;border-radius:10px;background:#101a2b;margin-top:12px;overflow-wrap:anywhere}
+    .wrap{overflow-x:auto}
+    table{border-collapse:collapse;width:100%;min-width:560px}
+    th,td{text-align:left;padding:10px;border-bottom:1px solid #26344c;font-size:13px}
+    th{color:#9aa8c0}
+    .good{color:#68e0a1}.bad{color:#ff8787}
+    .small{font-size:12px;color:#9aa8c0;line-height:1.6}
+    a{color:#9fc5ff}
+    @media(max-width:480px){main{padding:14px}.value{font-size:21px}h1{font-size:21px}}
+  </style>
 </head>
 <body>
 <main>
   <h1>UNI/USDT · Grid em simulação</h1>
-  <p>BNB Smart Chain · PancakeSwap V2 · Painel somente para leitura</p>
+  <div class="muted">BNB Smart Chain · PancakeSwap · atualização automática</div>
+
   <div class="notice">
-    Este bot não compra nem vende tokens reais. Ele consulta as reservas dos pools
-    e simula operações. Não usa chave privada e não garante lucro.
+    <b>Modo somente leitura e simulação.</b> O painel consulta a cotação e os saldos públicos da carteira,
+    mas este código não usa chave privada, não aprova tokens e não envia compras ou vendas reais.
   </div>
 
-  <section class="cards">
-    <div class="card"><span class="label">Preço consultado</span><strong class="value" id="price">Aguardando</strong></div>
-    <div class="card"><span class="label">USDT virtual</span><strong class="value" id="usdt">Aguardando</strong></div>
-    <div class="card"><span class="label">UNI virtual</span><strong class="value" id="uni">Aguardando</strong></div>
-    <div class="card"><span class="label">Resultado simulado</span><strong class="value" id="pnl">Aguardando</strong></div>
+  <div class="cards">
+    <div class="card"><div class="label">Preço UNI consultado</div><div class="value">{{ state.price_text }}</div><div class="small">{{ state.price_route or "Sem cotação" }}</div></div>
+    <div class="card"><div class="label">USDT virtual</div><div class="value">{{ state.virtual_usdt_text }}</div></div>
+    <div class="card"><div class="label">UNI virtual</div><div class="value">{{ state.virtual_uni_text }}</div></div>
+    <div class="card"><div class="label">Resultado simulado</div><div class="value {% if state.pnl_total >= 0 %}good{% else %}bad{% endif %}">{{ state.pnl_text }}</div></div>
+  </div>
+
+  <div class="status">
+    <b>Status:</b> {{ state.message }}<br>
+    <span class="small">Atualizado: {{ state.updated_at or "aguardando" }} · Preço inicial: {{ state.reference_text }}</span>
+  </div>
+
+  <section class="panel">
+    <h2>Saldos reais consultados, somente leitura</h2>
+    <div class="small">Carteira pública: {{ state.wallet }}</div>
+    <div class="cards" style="margin-top:12px">
+      <div><div class="label">BNB</div><b>{{ state.bnb_text }}</b></div>
+      <div><div class="label">UNI</div><b>{{ state.uni_text }}</b></div>
+      <div><div class="label">USDT</div><b>{{ state.usdt_text }}</b></div>
+    </div>
   </section>
 
-  <p id="status">Conectando...</p>
-  <p class="muted" id="route"></p>
-  <p class="muted" id="updated"></p>
-  <p class="error" id="error"></p>
-
-  <section class="columns">
-    <div class="box">
-      <h2>Níveis do grid</h2>
-      <div id="grids"></div>
-    </div>
-    <div class="box">
-      <h2>Últimas operações simuladas</h2>
-      <div id="history"></div>
+  <section class="panel">
+    <h2>Configuração do teste</h2>
+    <div class="small">
+      Capital virtual: US$ {{ "%.2f"|format(1.00) }} · 5 níveis em ±5% ·
+      US$ {{ "%.2f"|format(0.20) }} por nível · perda limite: US$ {{ "%.2f"|format(0.10) }} ·
+      slippage configurado: 1% · custo estimado da simulação: 0,30% por operação.
+      O slippage não é aplicado a transações, pois nenhuma transação real é enviada.
     </div>
   </section>
 
-  <section class="box" style="margin-top:12px">
-    <h2>Registro do bot</h2>
-    <div id="logs"></div>
+  <section class="panel">
+    <h2>Níveis do grid</h2>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Nível</th><th>Compra simulada</th><th>Venda simulada</th><th>Status</th></tr></thead>
+        <tbody>
+        {% for grid in state.grids %}
+          <tr><td>G{{ grid.n }}</td><td>{{ grid.buy_text }}</td><td>{{ grid.sell_text }}</td><td>{{ grid.status }}</td></tr>
+        {% else %}
+          <tr><td colspan="4">Aguardando a cotação inicial da PancakeSwap.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Últimas operações simuladas</h2>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Data</th><th>Tipo</th><th>Preço</th><th>Quantidade</th><th>Resultado</th></tr></thead>
+        <tbody>
+        {% for trade in state.trades %}
+          <tr><td>{{ trade.time }}</td><td>{{ trade.type }}</td><td>{{ trade.price_text }}</td><td>{{ trade.quantity_text }}</td><td>{{ trade.pnl_text }}</td></tr>
+        {% else %}
+          <tr><td colspan="5">Ainda sem operações simuladas.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  {% if state.last_error %}
+  <section class="panel bad"><b>Erro na consulta:</b> {{ state.last_error }}</section>
+  {% endif %}
+
+  <section class="panel small">
+    RPC atual: {{ state.rpc or "ainda não conectada" }}<br>
+    Patrimônio virtual: {{ state.equity_text }} · carteira real: consulta pública, sem acesso para movimentar fundos.
   </section>
 </main>
-
-<script>
-function fmt(n,d=6){
-  if(n===null||n===undefined)return "Aguardando";
-  return Number(n).toLocaleString("pt-BR",{minimumFractionDigits:2,maximumFractionDigits:d});
-}
-function safeText(value){
-  const el=document.createElement("span");
-  el.textContent=String(value ?? "");
-  return el.innerHTML;
-}
-async function load(){
-  try{
-    const response=await fetch("/api/state",{cache:"no-store"});
-    if(!response.ok)throw new Error("Falha ao consultar o estado do bot.");
-    const s=await response.json();
-
-    document.getElementById("price").textContent=
-      s.preco===null?"Aguardando":"$"+fmt(s.preco,6)+" USDT";
-    document.getElementById("usdt").textContent=
-      fmt(s.saldo_usdt_virtual,6)+" USDT";
-    document.getElementById("uni").textContent=
-      fmt(s.saldo_uni_virtual,8)+" UNI";
-    document.getElementById("pnl").textContent=
-      (s.resultado_usdt>=0?"+":"")+"$"+fmt(s.resultado_usdt,4);
-    document.getElementById("status").textContent="Status: "+s.status;
-    document.getElementById("route").textContent=
-      s.rpc_usado
-        ? "RPC: "+s.rpc_usado+" · Rota: "+(s.rota_usada||"aguardando")
-        : "";
-    document.getElementById("updated").textContent=
-      s.ultima_atualizacao?"Última atualização: "+s.ultima_atualizacao:"";
-    document.getElementById("error").textContent=s.last_error||"";
-
-    document.getElementById("grids").innerHTML=(s.grids||[]).map(g=>
-      '<div class="item">G'+g.id+' · $'+fmt(g.preco,6)+
-      ' · operações: '+g.operacoes+
-      ' · última: '+safeText(g.ultima_operacao)+'</div>'
-    ).join("")||'<div class="muted">Aguardando cotação inicial.</div>';
-
-    document.getElementById("history").innerHTML=(s.historico||[]).map(h=>
-      '<div class="item"><b>'+safeText(h.tipo)+'</b> · G'+h.nivel+
-      '<br>'+safeText(h.hora)+' · '+safeText(h.descricao)+
-      '<br><span class="muted">'+safeText(h.observacao)+'</span></div>'
-    ).join("")||'<div class="muted">Ainda sem operações simuladas.</div>';
-
-    document.getElementById("logs").innerHTML=(s.logs||[]).map(x=>
-      '<div class="item">'+safeText(x)+'</div>'
-    ).join("")||'<div class="muted">Aguardando registro.</div>';
-  }catch(e){
-    document.getElementById("error").textContent=
-      "Não foi possível carregar o painel. Atualize a página.";
-  }
-}
-load();
-setInterval(load,5000);
-</script>
 </body>
 </html>
 """
 
 @app.route("/")
-def home():
-    return render_template_string(HTML)
+@app.route("/dashboard")
+def dashboard():
+    return render_template_string(HTML, state=display_state())
 
-@app.route("/api/state")
-def api_state():
-    with lock:
-        return jsonify(STATE)
+@app.route("/api/status")
+def api_status():
+    return jsonify(display_state())
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "mode": "simulation"})
+    return jsonify({"status": "ok", "mode": "simulacao"})
 
-def iniciar_thread():
-    thread = threading.Thread(target=loop_bot, daemon=True)
-    thread.start()
+def start_monitor():
+    if not getattr(app, "_monitor_started", False):
+        app._monitor_started = True
+        thread = threading.Thread(target=monitoring_loop, daemon=True)
+        thread.start()
 
-iniciar_thread()
+start_monitor()
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000")),
-        threaded=True,
-    )
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
