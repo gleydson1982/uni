@@ -21,8 +21,9 @@ MAX_LOSS_USDT = 0.10
 SLIPPAGE_PERCENT = 0.01
 ESTIMATED_FEE_RATE = 0.003
 
+# Endereço corrigido do roteador PancakeSwap V2 na BNB Smart Chain.
 ROUTER = Web3.to_checksum_address(
-    "0x10ED43C718714eB63B5aA57B78B54704E256024E"
+    "0x10ED43C718714eB63d5aA57B78B54704E256024E"
 )
 UNI = Web3.to_checksum_address(
     "0xBf5140A22578168FD562DCcF235E5D43A02ce9B1"
@@ -90,7 +91,6 @@ ERC20_ABI = [
     },
 ]
 
-
 def fresh_state():
     return {
         "mode": "SIMULAÇÃO",
@@ -115,7 +115,6 @@ def fresh_state():
         "updated_at": "",
     }
 
-
 def load_state():
     state = fresh_state()
     try:
@@ -133,9 +132,7 @@ def load_state():
         pass
     return state
 
-
 STATE = load_state()
-
 
 def save_state():
     try:
@@ -145,7 +142,6 @@ def save_state():
         os.replace(temporary_file, STATE_FILE)
     except Exception as error:
         print(f"Não foi possível salvar a simulação: {error}")
-
 
 def connect_bsc():
     errors = []
@@ -181,7 +177,6 @@ def connect_bsc():
         + " | ".join(errors[:4])
     )
 
-
 def get_price(w3):
     uni_contract = w3.eth.contract(address=UNI, abi=ERC20_ABI)
     usdt_contract = w3.eth.contract(address=USDT, abi=ERC20_ABI)
@@ -215,7 +210,6 @@ def get_price(w3):
         + (" | ".join(errors) if errors else "Rota sem preço.")
     )
 
-
 def get_wallet_balances(w3):
     uni_contract = w3.eth.contract(address=UNI, abi=ERC20_ABI)
     usdt_contract = w3.eth.contract(address=USDT, abi=ERC20_ABI)
@@ -239,7 +233,6 @@ def get_wallet_balances(w3):
         "usdt": float(usdt_balance),
     }
 
-
 def initialize_grid(reference_price):
     # Cinco níveis espaçados dentro de uma faixa total de ±5%.
     step_fraction = (2 * GRID_RANGE) / GRID_LEVELS
@@ -260,7 +253,6 @@ def initialize_grid(reference_price):
         })
 
     return grids
-
 
 def update_simulation(price):
     if STATE["reference_price"] is None:
@@ -366,7 +358,6 @@ def update_simulation(price):
 
     STATE["last_price"] = price
 
-
 def monitoring_loop():
     while True:
         try:
@@ -407,7 +398,6 @@ def monitoring_loop():
             print(f"Erro de monitoramento: {error}")
 
         time.sleep(POLL_SECONDS)
-
 
 def display_state():
     with STATE_LOCK:
@@ -451,7 +441,6 @@ def display_state():
         trade["pnl_text"] = f"${trade['pnl']:+.4f}"
 
     return data
-
 
 HTML = """
 <!doctype html>
@@ -613,31 +602,25 @@ HTML = """
 </html>
 """
 
-
 @app.route("/")
 @app.route("/dashboard")
 def dashboard():
     return render_template_string(HTML, state=display_state())
 
-
 @app.route("/api/status")
 def api_status():
     return jsonify(display_state())
 
-
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "mode": "simulacao"})
-
 
 def start_monitor():
     if not getattr(app, "_monitor_started", False):
         app._monitor_started = True
         threading.Thread(target=monitoring_loop, daemon=True).start()
 
-
 start_monitor()
-
 
 if __name__ == "__main__":
     app.run(
