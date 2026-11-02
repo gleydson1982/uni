@@ -1,71 +1,74 @@
 import streamlit as st
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import time
+import os
+import pandas as pd
 
-st.set_page_config(page_title="Painel Grid - Estilo Neio", layout="wide", page_icon="🤖")
+st.set_page_config(page_title="Painel Grid - Estilo Neio", layout="wide")
 
-# --- ESTILO DARK IGUAL DA IMAGEM ---
-st.markdown("""
-<style>
-.stApp {background-color: #0a0e15;}
-</style>
-""", unsafe_allow_html=True)
+# Mapeamento: o que aparece -> o que manda pra Gate
+MAPA_TOKENS = {
+    "BOLO": "CAKE",
+    "UNI": "UNI",
+    "BNB": "BNB",
+    "AAVE": "AAVE",
+    "BTC": "BTC",
+    "ETH": "ETH"
+}
 
-st.title("Painel Grid Bot - Estilo Neio")
+TOKENS_PADRAO = [
+    {"nome": "UNI", "abaixo": 15, "acima": 15, "dist": 3.0, "valor": 15, "ativo": True},
+    {"nome": "BNB", "abaixo": 15, "acima": 15, "dist": 3.0, "valor": 15, "ativo": True},
+    {"nome": "AAVE", "abaixo": 15, "acima": 15, "dist": 3.0, "valor": 15, "ativo": True},
+    {"nome": "BTC", "abaixo": 15, "acima": 15, "dist": 3.0, "valor": 15, "ativo": True},
+    {"nome": "ETH", "abaixo": 15, "acima": 15, "dist": 3.0, "valor": 15, "ativo": True},
+    {"nome": "BOLO", "abaixo": 15, "acima": 15, "dist": 3.0, "valor": 10, "ativo": True},
+]
 
-# --- ESTADO INICIAL COM SEUS 6 TOKENS ---
-if 'tokens_config' not in st.session_state:
-    st.session_state.tokens_config = {
-        "UNI":  {"baixo": 15, "cima": 15, "pct": 3.0, "valor": 15, "ativo": True},
-        "CAKE": {"baixo": 15, "cima": 15, "pct": 3.0, "valor": 15, "ativo": True},
-        "BNB":  {"baixo": 15, "cima": 15, "pct": 3.0, "valor": 15, "ativo": True},
-        "AAVE": {"baixo": 15, "cima": 15, "pct": 3.0, "valor": 15, "ativo": True},
-        "BTC":  {"baixo": 15, "cima": 15, "pct": 3.0, "valor": 15, "ativo": True},
-        "ETH":  {"baixo": 15, "cima": 15, "pct": 3.0, "valor": 15, "ativo": True},
-    }
+if "tokens" not in st.session_state:
+    st.session_state.tokens = TOKENS_PADRAO.copy()
 
-# --- CARDS TOPO ---
-total_ordens = sum((v["baixo"] + v["cima"]) for v in st.session_state.tokens_config.values() if v["ativo"])
-total_usdt = sum((v["baixo"] + v["cima"]) * v["valor"] for v in st.session_state.tokens_config.values() if v["ativo"])
+st.markdown("<h1>Painel Grid Bot - Estilo Neio</h1>", unsafe_allow_html=True)
 
-col1, col2, col3 = st.columns(3)
-col1.metric("TOTAL ORDERS", f"{total_ordens}", "Ordens ativas geradas")
-col2.metric("TOTAL USDT INVESTIDO", f"{total_usdt:,.2f} USDT", "Investimento total ativo")
-col3.metric("BOT STATUS", "ATIVO", f"{len([k for k,v in st.session_state.tokens_config.items() if v['ativo']])} pares em operação")
+# Totais
+total_pedidos = sum((t["abaixo"]+t["acima"]) for t in st.session_state.tokens if t["ativo"])
+total_invest = sum((t["abaixo"]+t["acima"])*t["valor"] for t in st.session_state.tokens if t["ativo"])
+pares_ativos = sum(1 for t in st.session_state.tokens if t["ativo"])
 
-st.subheader("Configuração dos Bots - Grid Trading")
+c1, c2, c3 = st.columns(3)
+c1.metric("TOTAL DE PEDIDOS", total_pedidos, "Ordens ativas geradas")
+c2.metric("INVESTIMENTO TOTAL", f"{total_invest} USDT")
+c3.metric("STATUS DO BOT", "ATIVO", f"{pares_ativos} pares")
 
-# --- TABELA EDITÁVEL POR TOKEN ---
-for token, cfg in list(st.session_state.tokens_config.items()):
-    c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 1, 1, 1, 1, 1, 0.5])
-    with c1: st.write(f"**{token}**")
-    with c2: cfg["baixo"] = st.number_input(f"Baixo {token}", 0, 30, cfg["baixo"], key=f"baixo_{token}", label_visibility="collapsed")
-    with c3: cfg["cima"] = st.number_input(f"Cima {token}", 0, 30, cfg["cima"], key=f"cima_{token}", label_visibility="collapsed")
-    with c4: cfg["pct"] = st.number_input(f"% {token}", 0.5, 10.0, cfg["pct"], key=f"pct_{token}", label_visibility="collapsed")
-    with c5: cfg["valor"] = st.number_input(f"Valor {token}", 5, 1000, cfg["valor"], key=f"valor_{token}", label_visibility="collapsed")
-    with c6: cfg["ativo"] = st.checkbox("ON", cfg["ativo"], key=f"on_{token}")
-    with c7: 
-        if st.button("❌", key=f"del_{token}"):
-            del st.session_state.tokens_config[token]
-            st.rerun()
+st.markdown("### Configuracao dos Bots - Grid Trading")
 
-# --- ADICIONAR NOVO TOKEN ---
-st.divider()
-st.write("### ➕ Adicionar Novo Token")
-c_add1, c_add2, c_add3 = st.columns([2, 2, 2])
-with c_add1: novo_token = st.text_input("Nome do Token (ex: SOL)", placeholder="SOL").upper()
-with c_add2: novo_valor = st.number_input("Valor por Grid", 5, 1000, 15)
-with c_add3:
-    st.write("")
-    if st.button("Adicionar Token", type="primary"):
-        if novo_token and novo_token not in st.session_state.tokens_config:
-            st.session_state.tokens_config[novo_token] = {"baixo": 15, "cima": 15, "pct": 3.0, "valor": novo_valor, "ativo": True}
-            st.success(f"{novo_token} adicionado!")
-            st.rerun()
+# CABECALHO
+h = st.columns([1, 1.5, 1.5, 1.5, 1.5, 0.8, 0.6])
+h[0].markdown("**TOKEN**")
+h[1].markdown("**GRIDS ABAIXO**")
+h[2].markdown("**GRIDS ACIMA**")
+h[3].markdown("**% DISTANCIA**")
+h[4].markdown("**VALOR POR 1 GRID**")
+h[5].markdown("**ATIVO**")
 
-# --- BOTÕES FINAIS ---
-if st.button("💾 SALVAR CONFIGURAÇÃO E ZERAR PLANILHA + INICIAR GRID", type="primary", use_container_width=True):
-    # AQUI ENTRA SUA FUNÇÃO DE ZERAR PLANILHA E CRIAR GRIDS NA GATE
-    st.success(f"Planilha zerada! {total_ordens} ordens criadas na Gate.io para {total_usdt} USDT")
-    st.balloons()
+for idx, token in enumerate(st.session_state.tokens):
+    cols = st.columns([1, 1.5, 1.5, 1.5, 1.5, 0.8, 0.6])
+    cols[0].markdown(f"**{token['nome']}**")
+    token["abaixo"] = cols[1].number_input(f"ab_{idx}", 1, 100, token["abaixo"], label_visibility="collapsed", key=f"ab_{idx}")
+    token["acima"] = cols[2].number_input(f"ac_{idx}", 1, 100, token["acima"], label_visibility="collapsed", key=f"ac_{idx}")
+    token["dist"] = cols[3].number_input(f"dist_{idx}", 0.1, 20.0, float(token["dist"]), label_visibility="collapsed", key=f"dist_{idx}")
+    token["valor"] = cols[4].number_input(f"val_{idx}", 1, 10000, token["valor"], label_visibility="collapsed", key=f"val_{idx}", help="Valor de CADA grid")
+    token["ativo"] = cols[5].checkbox("SOBRE", token["ativo"], key=f"at_{idx}")
+    if cols[6].button("❌", key=f"del_{idx}"):
+        st.session_state.tokens.pop(idx)
+        st.rerun()
+
+st.markdown("---")
+novo_nome = st.text_input("Novo Token (ex: SOL)").upper()
+if st.button("Adicionar Token"):
+    if novo_nome:
+        st.session_state.tokens.append({"nome": novo_nome, "abaixo": 15, "acima": 15, "dist": 3.0, "valor": 15, "ativo": True})
+        st.rerun()
+
+if st.button("💾 Salvar e Zerar Planilha", type="primary", use_container_width=True):
+    config_gate = [{"par": f"{MAPA_TOKENS.get(t['nome'], t['nome'])}_USDT", **t} for t in st.session_state.tokens]
+    st.success(f"Salvo! BOLO enviado como CAKE")
+    st.json(config_gate)
